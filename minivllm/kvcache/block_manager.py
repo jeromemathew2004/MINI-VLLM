@@ -1,0 +1,158 @@
+from minivllm.engine.request import Request
+from collections import deque
+from minivllm.utils import utils
+import xxhash
+
+
+class KVCacheBlock:
+    def __init__(self, bid: int):
+        self.id = bid
+        self.refcount = 0
+        self.hash = -1
+        self.tokens: list[int] = []
+
+    def update(self, h: int, tokens: list[int]):
+        self.hash = h
+        self.tokens = tokens
+
+    def reset(self):
+        self.refcount = 1
+        self.hash = -1
+        self.tokens = []
+
+    @staticmethod
+    def compute_hash(tokens: list[int], prefix: int = - 1):
+        h = xxhash.xxh64()
+        if prefix != -1:
+            h.update(prefix.to_bytes(8, "little"))
+        for token in tokens:
+            h.update(token.to_bytes(4, "little", signed=True))
+        return h.intdigest()
+
+
+class KVCacheBlockManager:
+    def __init__(self, capacity: int, block_size: int, support_prefix_cache=False):
+        """
+        :param capacity: The number of KVCacheBlocks
+        :param block_size: The number of slots in each KVCacheBlock.
+
+        A KVCacheBlock is a logical block which represents a physical block of KV cache.
+        It is composed of a list of slots, and each slot can store a token.
+
+        +--------+--------+-----+--------+
+        | slot 1 | slot 2 | ... | slot n |
+        +--------+--------+-----+--------+
+        """
+
+        self.block_size: int = block_size
+        self.block_table: list[KVCacheBlock] = [KVCacheBlock(i) for i in range(capacity)]
+        self.free_block_ids: deque[int] = deque(range(capacity))
+        self.used_block_ids: set[int] = set()
+        self.hash_to_block_id: dict[int, int] = {}
+        self.support_prefix_cache = support_prefix_cache
+
+    def allocate_blocks_for_prefill(self, req: Request):
+        assert req.state == Request.WAITING
+        assert len(req.blocks) == 0
+
+        hash_ = -1
+        prefix_cache_miss = False
+        for i in range(0, len(req.tokens), self.block_size):
+            # get tokens for the current block
+            tokens = req.tokens[i: i + self.block_size]
+
+            # only full block can be cached
+            if len(tokens) == self.block_size and self.support_prefix_cache:
+                hash_ = KVCacheBlock.compute_hash(tokens, hash_)
+                
+                bid = self.hash_to_block_id.get(hash_, -1)
+                if bid == -1 or self.block_table[bid].tokens != tokens:
+                    prefix_cache_miss = True
+
+                if prefix_cache_miss:
+                    block = self._allocate()
+                else:
+                    req.num_cached_tokens += self.block_size
+                    if bid in self.used_block_ids:
+                        block = self.block_table[bid]
+                        assert block.refcount >= 1
+                        block.refcount += 1
+                    else:
+                        block = self._allocate(bid)
+                block.update(hash_, tokens)
+                self.hash_to_block_id[hash_] = block.id
+            else:
+                block = self._allocate()
+
+            req.blocks.append(block.id)
+
+    def allocate_block_for_decode(self, req: Request):
+        """
+        In decode stage, we only need to allocate a new block if all the allocated blocks are used.
+        """
+        assert req.state == Request.RUNNING
+        assert len(req.blocks) > 0
+        if self.request_required_blocks(req) > 0:
+            block = self._allocate()
+            assert block.refcount == 1
+            req.blocks.append(block.id)
+
+    def deallocate(self, req: Request):
+        for bid in reversed(req.blocks):
+            block = self.block_table[bid]
+            assert block.refcount > 0
+            block.refcount -= 1
+            if block.refcount == 0:
+                self.used_block_ids.remove(bid)
+                self.free_block_ids.append(bid)
+        req.blocks = []
+        req.num_cached_tokens = 0
+
+    def _allocate(self, bid=-1):
+        """
+        Allocate a new KVCacheBlock from free_block_ids.
+        :return: the allocated KVCacheBlock.
+        """
+        assert len(self.free_block_ids) > 0
+
+        if bid == -1:
+            bid = self.free_block_ids.pop()
+        else:
+            # alloc certain block
+            self.free_block_ids.remove(bid)
+        block = self.block_table[bid]
+        assert block.refcount == 0
+        block.reset()
+        self.used_block_ids.add(bid)
+        if block.hash != -1 and block.hash in self.hash_to_block_id:
+            del self.hash_to_block_id[block.hash]
+        return block
+
+    def can_allocate_new_block(self, req: Request):
+        """
+        check if the kv cache manager can allocate enough blocks for the request.
+        """
+        return len(self.free_block_ids) >= self.request_required_blocks(req)
+
+    def request_required_blocks(self, req: Request):
+        """
+        check if the request need append a new block for the request.
+        """
+        required_blocks = utils.cdiv(len(req.tokens), self.block_size)
+        return required_blocks - len(req.blocks)
+
+    def cache_block_if_needed(self, req: Request):
+        """
+        Cache the last block of the request if it is full
+        """
+        if len(req.tokens) % self.block_size == 0:
+            last_block = self.block_table[req.blocks[-1]]
+            assert last_block.hash == -1
+            tokens = req.tokens[-self.block_size:]
+            if len(req.blocks) > 1:
+                prefix = self.block_table[req.blocks[-2]].hash
+            else:
+                prefix = -1
+            h = KVCacheBlock.compute_hash(tokens, prefix)
+            last_block.update(h, tokens)
+            self.hash_to_block_id[h] = req.blocks[-1]
