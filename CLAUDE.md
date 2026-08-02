@@ -10,8 +10,11 @@ mini-vllm is a lightweight LLM inference engine built from scratch for learning 
 
 - Python 3.10+, CUDA-capable GPU required (the executor hardcodes `torch.set_default_device("cuda")`).
 - Dependencies: `pip install -r requirements.txt`. Note `mini-flash-attention` is installed from GitHub (`w4096/mini-flash-attention`), not PyPI — it is imported as `mini_flash_attention` in `minivllm/models/layers/attention.py`.
-- Demo/benchmark scripts default to a local model at `~/huggingface/Qwen3-0.6B/`; download with `hf download Qwen/Qwen3-0.6B`.
-- A `.venv` already exists in the repo root.
+- Demo/benchmark scripts default to a local model at `~/huggingface/Qwen3-0.6B/`; download with `hf download Qwen/Qwen3-0.6B`. `Config.__post_init__` asserts this path is a directory, so nothing runs without it.
+- **`requirements.txt` is incomplete:** `minivllm/models/layers/sampler.py` imports `flashinfer.sampling` at module top level, but `flashinfer` is not listed. Anything that imports `Sampler` — i.e. the whole engine — fails without it.
+- **The `.venv` in the repo root is a partial build** (verified 2026-08-03): `torch==2.9.1+cu130`, `transformers`, `tokenizers`, `safetensors`, `numpy`, `xxhash`, `huggingface_hub`. Enough for standalone HF experiments under `experiments/`, not enough for the engine — `mini-flash-attention`, `triton`, and `flashinfer` are all missing.
+- **GPU is currently unusable from this venv.** Host driver is 566.07 (CUDA 12.7 era) but the installed torch is a cu130 build, so `torch.cuda.is_available()` returns `False` with `cudaErrorNotSupported`. Fix is a cu126 torch wheel, not a driver-independent workaround. `~/huggingface/Qwen3-0.6B/` **is** downloaded.
+- Remaining Windows build risks for the engine proper: `mini-flash-attention` is a from-source CUDA build needing a CUDA toolkit + MSVC; official `triton` ships no Windows wheels (`triton-windows` is the usual substitute); `flashinfer` has no reliable Windows wheel.
 
 ## Common commands
 
@@ -54,7 +57,9 @@ Request flow: `Engine.step()` drives one iteration — `Scheduler.schedule()` pi
 
 ### Speculative decoding effort (in progress, not yet implemented)
 
-`speculative-decoding-plan.md` and `PROGRESS.md` track the speculative decoding effort. Current status: **Phase 0 complete, go decision recorded (2026-08-03).** An earlier no-go was reversed — it had assumed the multi-token verify pass must use the decode kernel, but a verify pass is a chunked-prefill shape and routes through `flash_attn_varlen_func` with a `block_table`, so no backend patch is needed. `docs/spec_decoding_feasibility.md` is the authoritative note.
+`speculative-decoding-plan.md` and `PROGRESS.md` track the speculative decoding effort. Current status: **Phases 0 and 2 complete (2026-08-03).** Phase 0's earlier no-go was reversed — it had assumed the multi-token verify pass must use the decode kernel, but a verify pass is a chunked-prefill shape and routes through `flash_attn_varlen_func` with a `block_table`, so no backend patch is needed. `docs/spec_decoding_feasibility.md` is the authoritative note.
+
+`experiments/spec_decode_prototype.py` is the Phase 2 deliverable: a standalone draft-and-verify implementation on plain HF models + `DynamicCache`, no engine involvement. It needs only torch + transformers and runs on CPU. Two gates, both passing: a statistical check that the rejection sampler's output distribution equals the target's, and a greedy exact-match check against plain greedy decoding. `rejection_sample()` there is written as a pure function so Phase 5 can port it into `Sampler` unchanged.
 
 Two things to know before working on this:
 
