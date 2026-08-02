@@ -132,12 +132,10 @@ Partially built. Standalone experiments run; the engine does not.
 - `.venv/` has `transformers==4.57.3`, tokenizers, safetensors, numpy, xxhash,
   huggingface_hub. Missing for the engine: `mini-flash-attention`, `triton`,
   `flashinfer`.
-- **torch: mid-migration.** The venv had `2.9.1+cu130`, which the host driver
-  cannot run. A `pip install --index-url .../cu126 --force-reinstall --no-deps
-  torch==2.9.1+cu126` was launched and **had not finished when the session
-  ended — its result is unverified.** Check with
-  `python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`
-  and re-run the install if it still reports `cu130` or `False`.
+- **torch: migrated and working.** `2.9.1+cu126`, `torch.cuda.is_available()`
+  is **True** (confirmed 2026-08-03). The venv previously held `2.9.1+cu130`,
+  which driver 566.07 cannot run. Note `requirements.txt` still pins
+  `torch==2.9.1+cu130`; following it verbatim would re-break CUDA on this host.
 - **`~/huggingface/Qwen3-0.6B/` is downloaded** (1.5 GB safetensors + tokenizer).
 - **`~/huggingface/Qwen3-draft-random/` is written** — see Draft checkpoint above.
 - Host driver is **566.07** (CUDA 12.7 era). It natively supports CUDA 12.6, so
@@ -235,23 +233,25 @@ order, so the CUDA installer can register its MSBuild integration:
 Verify: `nvcc --version` reports 12.6, and `cl.exe` resolves from a
 Developer Command Prompt (or after running `vcvars64.bat`).
 
-### Step 1 — finish the torch migration
+### Step 1 — torch: DONE, but re-confirm
 
-```sh
+```
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-Must print a `+cu126` version and `True`. If it still says `cu130` or `False`,
-the background install from the previous session did not complete:
+Completed 2026-08-03 — prints `2.9.1+cu126 True`. Re-run the check anyway; if
+it ever reports `cu130` or `False`, reinstall with:
 
-```sh
-pip install --index-url https://download.pytorch.org/whl/cu126 \
-    --force-reinstall --no-deps "torch==2.9.1+cu126"
+```
+pip install --index-url https://download.pytorch.org/whl/cu126 --force-reinstall --no-deps "torch==2.9.1+cu126"
 ```
 
-Note plain `torch==2.9.1` is **not** enough — pip treats the installed
+Note plain `torch==2.9.1` is **not** enough — pip treats an installed
 `2.9.1+cu130` as already satisfying it and silently does nothing. The
 `+cu126` local version and `--force-reinstall` are both required.
+
+All commands in this runbook are written as single lines on purpose: this is a
+Windows/PowerShell host, where `\` is not a line-continuation character.
 
 ### Step 2 — the remaining engine dependencies
 
@@ -296,10 +296,8 @@ Also worth running once CUDA works, independent of the engine —
 `Config.__post_init__` imports no torch, so this can be checked even before
 step 2 lands:
 
-```sh
-python -c "from minivllm.config.config import Config; \
-c = Config(use_speculative_decoding=True, draft_model='~/huggingface/Qwen3-draft-random/'); \
-print(c.draft_hf_config.vocab_size, c.draft_hf_config.dtype, c.num_speculative_tokens)"
+```
+python -c "from minivllm.config.config import Config; c = Config(use_speculative_decoding=True, draft_model='~/huggingface/Qwen3-draft-random/'); print(c.draft_hf_config.vocab_size, c.draft_hf_config.dtype, c.num_speculative_tokens)"
 ```
 
 ### Step 5 — Phase 4
