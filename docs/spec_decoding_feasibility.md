@@ -80,6 +80,22 @@ It matters for this project because the verify pass wants exactly this call
 *with* the block table. Fixing it is a prerequisite for Phase 4, and it is a
 real pre-existing correctness fix in its own right.
 
+## GPU architecture check (added 2026-08-03)
+
+`mini-flash-attention` requires **SM 80+** — "NVIDIA Ampere GPU or newer",
+CUDA 11.8+, tested on CUDA 12.8. The host GPU reports **compute capability
+8.6**, so it clears the floor.
+
+Worth recording because it cuts off the obvious fallback: **free Colab and
+free Kaggle both provide a T4 (sm_75)**, and Kaggle's alternative is a P100
+(sm_60). Both are *below* SM 80. A cloud escape hatch would have to be a paid
+Ampere-or-newer tier, so the local 4 GB laptop GPU is the only free
+environment that can run this backend at all.
+
+The risk is therefore the toolchain, not the hardware: the build compiles
+CUTLASS with `-std=c++20` and the project's README only documents a Linux
+build path, so the MSVC route is unexercised.
+
 ## VRAM check
 
 - Host GPU: NVIDIA GeForce RTX 3050 Laptop GPU, 4096 MiB total.

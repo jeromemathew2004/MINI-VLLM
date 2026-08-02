@@ -4,7 +4,7 @@ import logging
 from minivllm.config.config import Config
 from minivllm.engine.request import Request
 from minivllm.executor.context import Context
-from minivllm.models.loader import load_model
+from minivllm.models.loader import load_model, load_draft_model
 from minivllm.scheduler.batch import Batch
 from minivllm.models.layers.sampler import Sampler
 from minivllm.executor.graph import CudaGraphRunner
@@ -16,6 +16,12 @@ class Executor:
         torch.set_default_device("cuda")
         torch.set_default_dtype(config.hf_config.dtype)
         self.model = load_model(config)
+
+        # Loaded before _warmup_model so that the free/peak memory numbers
+        # _init_kv_cache reads already account for the draft's weights.
+        self.draft_model = load_draft_model(config) if config.use_speculative_decoding else None
+        self.draft_kv_cache = None
+
         self.sampler = Sampler()
 
         self._warmup_model()
@@ -28,18 +34,49 @@ class Executor:
             self.graph_runner.capture()
 
         
+    @staticmethod
+    def _kv_head_dim(hf_config) -> int:
+        return getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+
+    def _kv_block_bytes(self, hf_config) -> int:
+        """Bytes one KV-cache block costs for a model with this config."""
+        return (2 * hf_config.num_hidden_layers * self.config.kv_cache_block_size
+                * hf_config.num_key_value_heads * self._kv_head_dim(hf_config)
+                * hf_config.dtype.itemsize)
+
+    def _alloc_kv_cache(self, hf_config, num_blocks: int) -> torch.Tensor:
+        return torch.empty(2, hf_config.num_hidden_layers, num_blocks,
+                           self.config.kv_cache_block_size,
+                           hf_config.num_key_value_heads, self._kv_head_dim(hf_config))
+
+    @staticmethod
+    def _wire_kv_cache(model, kv_cache: torch.Tensor) -> int:
+        """Point each attention layer at its slice of `kv_cache`."""
+        layer_id = 0
+        for module in model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = kv_cache[0, layer_id]
+                module.v_cache = kv_cache[1, layer_id]
+                layer_id += 1
+        return layer_id
+
     def _init_kv_cache(self):
         logging.info("Initializing key-value cache...")
-    
+
         config = self.config
         hf_config = self.config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * config.kv_cache_block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+
+        block_bytes = self._kv_block_bytes(hf_config)
+        if self.draft_model is not None:
+            # The draft cache is allocated with the same block size and the
+            # same number of blocks as the target cache, so one block id costs
+            # a block in each and both have to come out of the same budget.
+            block_bytes += self._kv_block_bytes(config.draft_hf_config)
+
         kv_cache_num_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert kv_cache_num_blocks > 0
 
@@ -47,17 +84,30 @@ class Executor:
 
         # update the config with the new value
         config.kv_cache_num_blocks = kv_cache_num_blocks
-        
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, kv_cache_num_blocks, config.kv_cache_block_size, num_kv_heads, head_dim)
-        
+
+        self.kv_cache = self._alloc_kv_cache(hf_config, kv_cache_num_blocks)
+        num_wired = self._wire_kv_cache(self.model, self.kv_cache)
+        assert num_wired == hf_config.num_hidden_layers
+
         logging.info(f'Allocated {kv_cache_num_blocks} key-value cache blocks.')
-        
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+
+        if self.draft_model is not None:
+            # The draft gets its own cache tensor but *not* its own allocator:
+            # a slot index is block_id * kv_cache_block_size + offset, which
+            # depends only on the block size, so the block ids in req.blocks —
+            # handed out by the single KVCacheBlockManager — address both
+            # caches. ctx.slot_mapping and ctx.block_table are therefore valid
+            # for the draft as-is, and the block manager needs no changes.
+            #
+            # This deviates from speculative-decoding-plan.md, which called for
+            # a non-paged contiguous draft cache. FlashAttention.forward has no
+            # non-paged path, so that would have meant a second attention path
+            # in a file the target model also depends on. See PROGRESS.md.
+            self.draft_kv_cache = self._alloc_kv_cache(config.draft_hf_config, kv_cache_num_blocks)
+            num_wired = self._wire_kv_cache(self.draft_model, self.draft_kv_cache)
+            assert num_wired == config.draft_hf_config.num_hidden_layers
+
+            logging.info(f'Allocated a draft key-value cache over the same {kv_cache_num_blocks} blocks.')
 
     def _warmup_model(self):
         logging.info("Warming up model...")
