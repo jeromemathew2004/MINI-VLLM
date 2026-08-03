@@ -2,6 +2,14 @@
 
 Original date: 2026-07-19
 Revised: 2026-08-03 — **decision reversed from no-go to go**
+Revised again: 2026-08-03 (Phase 4) — **go stands, but the mechanism below is
+wrong**. The verify pass does *not* go through `flash_attn_varlen_func`. That
+kernel's causal mask is top-left anchored, which the signature does not reveal
+and which makes the shape unusable. The verify pass goes through the decode
+kernel instead, with K+1 tokens in the batch dimension. See "Phase 4
+measurements" at the bottom — that section supersedes the reasoning in the
+middle of this document, which is kept because the record of *why* the wrong
+conclusion looked right is worth having.
 
 ## Summary of the revision
 
@@ -114,17 +122,70 @@ build path, so the MSVC route is unexercised.
 - **VRAM headroom: confirmed but tight**; see above.
 - **Phase 0 outcome: go.**
 
-## Still to validate empirically
+## Phase 4 measurements (2026-08-03) — supersedes the above
 
-The signature and docstring are confirmed; the following need a live GPU
-check once the environment is built, and are the first things to test in
-Phase 4:
+Run `python experiments/paged_varlen_check.py`. The two questions this note
+left open were answered, and answering them overturned the mechanism proposed
+above.
 
-1. Exact semantics of `cu_seqlens_k` when `block_table` is passed — whether
-   it carries full per-sequence KV length (expected) and how the kernel maps
-   logical position to `block_table[b][pos // block_size]`.
-2. That the 4-D cache tensor `(num_blocks, block_size, num_kv_heads,
-   head_dim)` is accepted directly in the `k`/`v` slots under the paged path.
+### 1. `causal=True` is TOP-LEFT anchored — the varlen verify pass cannot work
 
-Neither affects the go decision — they affect how the Phase 4 context is
-built, and both are cheap to check with a small standalone script.
+This is the finding that matters. `csrc/mfa/prefill.cuh:416` masks on
+`col_0 > row_0`, with `row` counted from the start of the query segment and
+**no `seqlen_k - seqlen_q` shift**. Measured: with `seqlen_k=256`, a query
+segment of 1, 5, 17 or 64 tokens matches a top-left reference to 7.8e-03 and
+disagrees with a bottom-right reference by ~2.5. Only `seqlen_q == seqlen_k`
+matches both, which is why the existing prefill path never exposed it.
+
+Real FlashAttention anchors bottom-right, and the section above assumed
+mini-flash-attention does too. It does not. Under top-left anchoring a K+1
+token verify query attends to keys 0..j instead of to its own history — every
+proposal would be scored blind to the prompt. No `block_table` fix changes
+this; it is the mask, not the gather.
+
+This also means the repo's prefix-caching prefill path is unfixable as written,
+not merely missing its `block_table` argument. `attention.py` now passes the
+block table *and* asserts `seqlen_q == seqlen_k`, so the path fails loudly
+instead of returning quietly wrong attention.
+
+### 2. The paged gather is correct only when the page is a multiple of 64
+
+Both kernels resolve **one block-table entry per N-tile**, not per key row
+(`prefill.cuh:52`, `decode.cuh:50`):
+
+```
+block_table_idx    = nbidx * kBlockN / page_block_size
+block_table_offset = nbidx * kBlockN - block_table_idx * page_block_size
+offset = block_table[block_table_idx] * cache_block_stride + ...
+```
+
+then read `kBlockN` consecutive rows from `offset`. `flash.cu` instantiates
+both with `kBlockN = 64`. A tile straddling two pages reads its second half
+from whatever block physically follows the first. Measured: block sizes 16 and
+32 corrupt (max err 3.4e+02), 64/128/256 are exact. The repo is safe at 256
+stock and 64 in the 4 GB profile, and `Config.__post_init__` now asserts the
+rule so a smaller value fails instead of silently corrupting.
+
+The 4-D cache tensor *is* accepted directly in the `k`/`v` slots, as hoped.
+
+### 3. The verify pass goes through the decode kernel
+
+`flash_attn_with_kvcache`'s `assert q.size(1) == 1` constrains the **query
+dimension, not the token count**. K+1 tokens become K+1 rows of the *batch*
+dimension, each carrying its own `cache_seqlens` and its own copy of the
+request's block-table row, so each attends to exactly its own prefix — which is
+the verify semantics, exactly. Measured against dense attention: `0.00e+00`.
+
+One forward pass over `num_requests * (K+1)` tokens, one GEMM per projection;
+only the attention gather is per-row. No backend patch needed, and the paged
+path used is the one the repo already exercises in production.
+
+Also worth recording: **without** a `block_table`, `flash_attn_varlen_func`
+requires `total_k == total_q` ("k must have shape (total_q_len, kv_num_heads,
+head_dim)"), so the non-paged escape hatch does not exist either.
+
+### 4. Unrelated blocker found: decode is nondeterministic at batch width >= 6
+
+Not a speculative-decoding bug, and it reproduces on a clean checkout. See
+`experiments/decode_determinism_check.py` and the PROGRESS.md entry. It caps
+the usable K, because a verify pass runs at width `num_requests * (K+1)`.

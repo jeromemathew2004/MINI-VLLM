@@ -211,6 +211,114 @@ class Executor:
         return input_ids, ctx
 
 
+    def _build_verify_input(self, requests: list[Request],
+                            proposals: list[list[int]]) -> tuple[torch.Tensor, Context]:
+        """Inputs for a speculative verify pass: K+1 query tokens per request.
+
+        Entering a round, a request's KV cache holds `req.tokens[:-1]` — the
+        last committed token has been sampled but never fed through the model
+        (this is the same invariant the Phase 2 prototype maintains, and the
+        reason `_build_decode_input` feeds `req.tokens[-1]`). The verify pass
+        feeds that token followed by the draft's K proposals, so query token j
+        sits at absolute position `len(req.tokens) - 1 + j` and must attend to
+        keys 0..that position — which includes the proposals ahead of it in the
+        same pass, already written to the cache by `store_kvcache`.
+
+        Shape note, and a correction to the plan. This is *not* routed through
+        `flash_attn_varlen_func`, which speculative-decoding-plan.md section 7
+        and the Phase 0 note both assumed it would be. That kernel anchors its
+        causal mask TOP-LEFT: a K+1-token query segment against a longer key
+        sequence attends to keys 0..j rather than to its own prefix, leaving
+        every query blind to the request's history. Measured, with the kernel
+        source cited, in experiments/paged_varlen_check.py.
+
+        The decode kernel does express this shape. Its `seqlen_q == 1` assert
+        constrains the *query* dimension, not the number of tokens in flight,
+        so the K+1 tokens ride in the batch dimension as K+1 rows, each with
+        its own `cache_seqlens` and its own copy of the request's block-table
+        row. The result is still one forward pass over
+        `num_requests * (K+1)` tokens with one GEMM per projection; only the
+        attention gather is per-row.
+        """
+        block_size = self.config.kv_cache_block_size
+
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        cache_seqlens = []
+        block_table = []
+
+        max_block_len = max(len(req.blocks) for req in requests)
+
+        for req, proposal in zip(requests, proposals):
+            base = len(req.tokens) - 1
+            padded_blocks = req.blocks + [-1] * (max_block_len - len(req.blocks))
+
+            for offset, token in enumerate([req.tokens[-1], *proposal]):
+                pos = base + offset
+                assert pos // block_size < len(req.blocks), (
+                    f"request {req.id} holds {len(req.blocks)} blocks, too few to reach "
+                    f"position {pos}. A verify pass writes KV for tokens that are not in "
+                    f"req.tokens yet, so the caller must reserve them first with "
+                    f"allocate_block_for_decode(req, extra_tokens={len(proposal)})."
+                )
+                input_ids.append(token)
+                positions.append(pos)
+                # Each row attends to its own prefix, inclusive of itself.
+                cache_seqlens.append(pos + 1)
+                slot_mapping.append(req.blocks[pos // block_size] * block_size + pos % block_size)
+                block_table.append(padded_blocks)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        ctx = Context(
+            prefill=False,
+            positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            cache_seqlens = torch.tensor(cache_seqlens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            block_table = torch.tensor(block_table, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+        )
+        return input_ids, ctx
+
+    @torch.inference_mode()
+    def verify(self, requests: list[Request], proposals: list[list[int]]) -> torch.Tensor:
+        """Score the draft's proposals against the target model in one pass.
+
+        Returns `(num_requests, K+1, vocab_size)`. Row j of a request is the
+        target's distribution for the token that *follows* query token j: row 0
+        follows the request's last committed token — so it is exactly what a
+        plain decode step would have produced — row j>0 follows proposal j-1,
+        and row K is the bonus distribution used when every proposal is
+        accepted.
+
+        **Stale KV.** The pass writes cache entries for all K proposals before
+        anyone knows how many will be accepted. If only M < K are, the slots for
+        positions [len+M, len+K) hold KV for tokens that never entered the
+        sequence. They are deliberately left in place rather than zeroed,
+        because nothing can read them: every read is bounded by `cache_seqlens`,
+        which is derived from the request's committed token count, and the next
+        round's verify pass begins writing at exactly the first dead slot. So
+        the stale region is unreadable until it is overwritten, and clearing it
+        would be pure cost. This is the "cache_seqlens is the source of truth"
+        option from speculative-decoding-plan.md section 7.3. The zero-acceptance
+        case (M=0), where the whole proposal region goes stale every round, is
+        the one most implementations get wrong and is covered explicitly by
+        experiments/verify_pass_gate.py.
+
+        **CUDA graphs are bypassed.** `CudaGraphRunner` captures one query row
+        per request and a verify pass has K+1, so this calls the model eagerly.
+        Recorded as a known limitation, per plan section 7.4.
+        """
+        assert requests, "verify() needs at least one request"
+        num_proposals = len(proposals[0])
+        assert all(len(p) == num_proposals for p in proposals), (
+            "every request in a verify batch must carry the same number of proposals, "
+            "since the returned logits are a dense (num_requests, K+1, vocab) tensor"
+        )
+
+        input_ids, ctx = self._build_verify_input(requests, proposals)
+        logits = self.model(ctx, input_ids, ctx.positions)
+        return logits.view(len(requests), num_proposals + 1, -1)
+
     @staticmethod
     def _build_block_table(requests: list[Request]) -> torch.Tensor:
         max_block_len = max(len(req.blocks) for req in requests)

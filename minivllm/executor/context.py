@@ -61,6 +61,13 @@ class Context:
     req 0 has kv cache sequence length of 4
     req 1 has kv cache sequence length of 3
     then the cache_seqlens is [4, 3]
+
+    Note this indexes QUERY ROWS, which is the same thing as requests only
+    because plain decode contributes exactly one query token per request. A
+    speculative verify pass contributes K+1 query tokens per request, each
+    attending to a different amount of that request's history, so it emits K+1
+    entries per request -- one per token, holding that token's own prefix
+    length. See Executor._build_verify_input.
     """
     cache_seqlens: torch.Tensor | None = None
 
@@ -77,6 +84,9 @@ class Context:
         [0, 1, 2, 3 ],  # req 0
         [4, 5, 6, -1],  # req 1
     ]
+
+    One row per query row, matching cache_seqlens above: a verify pass repeats
+    a request's row once per query token it contributes.
     """
     block_table: torch.Tensor | None = None
 

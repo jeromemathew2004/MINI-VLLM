@@ -80,13 +80,40 @@ class FlashAttention(nn.Module):
             # in this situation, we need to provide the full k_cache and v_cache and
             # the block_table to flash attention
             if ctx.block_table is not None:
+                # The block table was documented as required here but never
+                # actually passed, so the kernel read the paged cache as if it
+                # were contiguous. Passing it is the fix for that bug -- but it
+                # is not enough to make prefix caching correct, hence the
+                # assert below.
+                #
+                # This kernel anchors its causal mask TOP-LEFT: it masks on
+                # `col > row` with row counted from the start of the query
+                # segment and no seqlen_k - seqlen_q shift (csrc/mfa/prefill.cuh
+                # in w4096/mini-flash-attention, measured in
+                # experiments/paged_varlen_check.py). A prefix-cached prefill
+                # feeds only the uncached suffix as queries against the full
+                # key sequence, which needs BOTTOM-RIGHT anchoring; under
+                # top-left every query attends to the wrong keys. Fail loudly
+                # rather than return quietly wrong attention.
+                assert ctx.max_seqlen_q == ctx.max_seqlen_k, (
+                    "prefix-caching prefill (seqlen_q < seqlen_k) needs a bottom-right "
+                    "anchored causal mask, which mini-flash-attention does not implement. "
+                    "Run KVCacheBlockManager with support_prefix_cache=False, or see "
+                    "experiments/paged_varlen_check.py for the measurement."
+                )
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=ctx.max_seqlen_q, cu_seqlens_q=ctx.cu_seqlens_q,
                                        max_seqlen_k=ctx.max_seqlen_k, cu_seqlens_k=ctx.cu_seqlens_k,
-                                       causal=True)
+                                       causal=True,
+                                       block_table=ctx.block_table)
         else:
-            # decode
+            # Decode, and also the speculative verify pass. The kernel asserts
+            # seqlen_q == 1, which constrains the *query* dimension and not the
+            # number of tokens in flight: a verify pass passes its K+1 tokens
+            # per request as K+1 separate rows of the batch dimension, each
+            # carrying its own cache_seqlens and its own copy of the request's
+            # block-table row. See Executor._build_verify_input.
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=ctx.cache_seqlens, block_table=ctx.block_table)
         return o

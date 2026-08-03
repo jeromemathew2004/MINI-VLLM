@@ -86,13 +86,21 @@ class KVCacheBlockManager:
 
             req.blocks.append(block.id)
 
-    def allocate_block_for_decode(self, req: Request):
+    def allocate_block_for_decode(self, req: Request, extra_tokens: int = 0):
         """
         In decode stage, we only need to allocate a new block if all the allocated blocks are used.
+
+        :param extra_tokens: room to reserve beyond len(req.tokens). A plain
+            decode step appends one token and needs none. A speculative verify
+            pass writes KV for K proposed tokens that are not in req.tokens yet,
+            so it passes extra_tokens=K; those slots must exist before the pass
+            runs, because rejected proposals are only invalidated logically.
         """
         assert req.state == Request.RUNNING
         assert len(req.blocks) > 0
-        if self.request_required_blocks(req) > 0:
+        # A loop, not an `if`: one token needs at most one new block, but
+        # extra_tokens can span several when K exceeds the block size.
+        for _ in range(self.request_required_blocks(req, extra_tokens)):
             block = self._allocate()
             assert block.refcount == 1
             req.blocks.append(block.id)
@@ -128,17 +136,20 @@ class KVCacheBlockManager:
             del self.hash_to_block_id[block.hash]
         return block
 
-    def can_allocate_new_block(self, req: Request):
+    def can_allocate_new_block(self, req: Request, extra_tokens: int = 0):
         """
         check if the kv cache manager can allocate enough blocks for the request.
         """
-        return len(self.free_block_ids) >= self.request_required_blocks(req)
+        return len(self.free_block_ids) >= self.request_required_blocks(req, extra_tokens)
 
-    def request_required_blocks(self, req: Request):
+    def request_required_blocks(self, req: Request, extra_tokens: int = 0):
         """
         check if the request need append a new block for the request.
+
+        `extra_tokens` reserves space past the committed tokens; see
+        allocate_block_for_decode.
         """
-        required_blocks = utils.cdiv(len(req.tokens), self.block_size)
+        required_blocks = utils.cdiv(len(req.tokens) + extra_tokens, self.block_size)
         return required_blocks - len(req.blocks)
 
     def cache_block_if_needed(self, req: Request):

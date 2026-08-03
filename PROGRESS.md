@@ -19,7 +19,17 @@ This file is a concise handoff log for LLM agents. It tracks progress against [s
 - **Phase 3: complete and validated on GPU (2026-08-03).** The environment is
   built, the engine runs, and the exit criterion passes byte-identically. See
   Phase 3 Validation.
-- **Phase 4 is next and is no longer blocked.** Start at RESUME HERE.
+- **Phase 4: complete and gated on GPU (2026-08-03).** The multi-token verify
+  pass exists (`Executor.verify`) and provably equals K+1 sequential decode
+  steps. It is **not** built on `flash_attn_varlen_func` as the plan and the
+  Phase 0 note assumed — that kernel's causal mask is top-left anchored, which
+  makes the shape unusable. See Phase 4 Results.
+- **Two bugs found along the way**, one fixed here and one out of scope:
+  prefix-caching prefill was doubly broken (missing `block_table` *and* the
+  wrong mask anchoring), and **plain decode is nondeterministic at batch width
+  >= 6** — pre-existing, unrelated to speculative decoding, and now the main
+  blocker on this project's usable K and on serving generally.
+- **Phase 5 is next.** Start at RESUME HERE.
 
 ## Phase 2 Results (2026-08-03, CPU, Qwen3-0.6B float32)
 
@@ -147,6 +157,141 @@ accepted often. Dimensions are CLI flags.
 Engine loads both models and non-speculative output is byte-identical with
 `use_speculative_decoding` on and off. Verified 2026-08-03; see Phase 3
 Validation above.
+
+## Phase 4 Results (2026-08-03, RTX 3050 4 GB)
+
+Two gate scripts, both passing:
+
+```
+python experiments/paged_varlen_check.py     # kernel semantics -> RESULT: PASS
+python experiments/verify_pass_gate.py       # the verify pass  -> GATE: PASS
+```
+
+### The plan's verify mechanism was wrong; the phase still lands
+
+`speculative-decoding-plan.md` section 7 and the reversed Phase 0 note both
+said the verify pass is a `flash_attn_varlen_func` call with a `block_table`
+and `causal=True`. On the GPU that does not work: **the causal mask is
+top-left anchored** (`csrc/mfa/prefill.cuh:416` masks `col > row` with no
+`seqlen_k - seqlen_q` shift). A K+1-token query against a longer cache would
+attend to keys 0..j instead of to its own history. Phase 0 reasoned from the
+signature, which does not show this.
+
+**What works instead:** `flash_attn_with_kvcache`. Its `assert seqlen_q == 1`
+constrains the *query* dimension, not the token count, so the K+1 tokens ride
+in the **batch** dimension as K+1 rows, each with its own `cache_seqlens` and
+its own copy of the request's block-table row. Each row then attends to exactly
+its own prefix. Still one forward pass, one GEMM per projection; only the
+attention gather is per-row. Verified against dense attention at `0.00e+00`.
+
+Full derivation, with the kernel source cited and the block-size rule, is in
+[docs/spec_decoding_feasibility.md](docs/spec_decoding_feasibility.md).
+
+### What Phase 4 added
+
+- `Executor._build_verify_input` / `Executor.verify(requests, proposals)`,
+  returning `(num_requests, K+1, vocab_size)` logits. Row 0 is what a plain
+  decode step would produce; row K is the bonus distribution.
+- `block_manager.allocate_block_for_decode(req, extra_tokens=K)` —
+  `request_required_blocks` / `can_allocate_new_block` grew the same optional
+  argument, defaulting to 0 so existing behaviour is untouched. The allocator
+  is now a loop rather than a single `if`, since K can exceed a block.
+- `attention.py` now passes `block_table=` to `flash_attn_varlen_func` (the
+  documented-but-absent argument) **and** asserts `seqlen_q == seqlen_k` there,
+  because passing it is necessary but not sufficient — see above.
+- `Config.__post_init__` asserts `kv_cache_block_size % 64 == 0`. Both kernels
+  resolve one block-table entry per 64-key tile, so a smaller page silently
+  corrupts attention past a sequence's first page. Measured: 16 and 32 corrupt,
+  64/128/256 exact.
+- CUDA graphs are bypassed for verify passes (plan section 7.4).
+
+### Stale-KV strategy, and how it is tested
+
+The pass writes KV for all K proposals before anyone knows how many are
+accepted. If M < K are, the slots for positions `[len+M, len+K)` hold tokens
+that never entered the sequence. **They are left in place, not zeroed**: every
+read is bounded by `cache_seqlens`, which derives from the committed token
+count, and the next round's verify pass starts writing at exactly the first
+dead slot. So the region is unreadable until overwritten. This is the
+"`cache_seqlens` is the source of truth" option from plan section 7.3.
+
+`verify_pass_gate.py` forces every acceptance regime — full, partial, zero, and
+a `mixed` script that cycles M over 0..K so consecutive rounds overwrite stale
+regions of every size. Zero-acceptance, the case implementations get wrong
+first, is covered every round of its script.
+
+### Why the gate is not "byte-identical greedy output"
+
+It cannot be, and this matters for Phase 6. Model logits depend on the batch
+shape: decoding one request at width 1 and at width 5 — no verify pass anywhere
+— differs by up to 0.5 absolute (mean 0.087), because cuBLAS picks different
+tilings per shape. A verify pass has K+1 rows where decode has 1, so its logits
+are *necessarily* not bitwise equal to sequential decode's.
+
+The gate is therefore stated against a measured noise floor:
+
+| gate | claim | result |
+|---|---|---|
+| 1 | `verify()` with K=0 is one query row, so it must match decode **bitwise** | `max diff = 0.000000` |
+| 2 | `verify()` row 0 adds no error beyond its batch width | `max\|decode@5 - verify[0]\| = 0.0000` |
+| 3 | one verify pass == K+1 sequential decode steps, at 7 anchors x 4 acceptance scripts x 2 prompts | 162 rows, **0 hard mismatches**, 1 near-tie |
+
+Gate 2 is the decisive one: **compared against a decode at the same batch width,
+the verify pass is bitwise identical.** All observed deviation is the batch
+shape, none of it the verify pass.
+
+Gate 3 is freshly anchored at each measurement rather than free-running,
+because the KV cache is *written* by these passes as well as read: a batch-1
+decode walk and a batch-5 verify walk lay down slightly different K/V and drift
+apart over dozens of rounds. An earlier free-running version of this gate
+failed for exactly that reason and was measuring drift, not correctness.
+
+**Phase 6 will hit this.** Its planned exit criterion — byte-identical greedy
+output with speculation on and off — is not achievable in bf16 once Phase 5
+makes speculation actually change batch shapes. (Phase 3's gate passed only
+because the draft was loaded and never run, leaving shapes identical.) Either
+run that gate in float32 or restate it as distributional equivalence plus
+near-tie classification, as gate 3 does here.
+
+## Blocker found: decode is nondeterministic at batch width >= 6
+
+**Pre-existing, unrelated to speculative decoding, reproduces on a clean
+checkout with everything in this phase stashed.** Reproduction:
+
+```
+python experiments/decode_determinism_check.py
+```
+
+Calling the *same* decode step twice on the *same* requests returns different
+logits. The pass is idempotent, so they must agree bitwise. Below width 6 they
+do; at and above it they diverge by up to 21.7, and at some widths the argmax
+changes, i.e. the engine emits a different token. Identical requests batched
+together disagree with each other by the same margin.
+
+Ruled out by direct experiment: the `num_splits` heuristic (pinning it to 1
+only moves which widths break), `@torch.compile` on `MLP.forward`
+(`TORCHDYNAMO_DISABLE=1`, same), and uninitialized KV cache (`zeros` and a
+constant fill, same). The kernel reproduces it standalone on random tensors
+with no engine involved, which localises it to
+`csrc/mfa/decode.cuh`. The signature — clean at low occupancy, corrupting
+unpredictably as more blocks become resident — is a missing or mis-scoped
+shared-memory barrier. Note the kernel aliases several buffers over one
+`extern __shared__` region (`decode.cuh:588`, `:628`) while `flash.cu` sizes
+that allocation for Q + K + V only.
+
+Consequences:
+
+- **`max_num_batched_seqs` above ~5 is not currently safe.** The 4 GB profile
+  uses 8; the stock `Config` uses 512; `benchmark/` runs far higher.
+- Existing gates pass because they run two prompts — batch width 2.
+- **It caps K.** A verify pass is width `num_requests * (K+1)`, so one request
+  at K=4 is width 5, the last safe width. `verify_pass_gate.py` is gated at
+  K=4 for this reason and fails at K=8 with mismatches that belong to this bug.
+- Phase 7's throughput sweep over K is blocked on this, not just on Phase 1.
+
+Fixing it means patching `mini-flash-attention` and rebuilding (recipe in
+Environment State). That is a separate piece of work and was left out of
+Phase 4 deliberately.
 
 ## Environment State (BUILT — verified 2026-08-03)
 
@@ -278,9 +423,14 @@ too coarse a quantum when the whole budget is ~1.6 GB.
 - `flash_attn_with_kvcache` asserts `seqlen_q == 1` — confirmed, unchanged.
 - **`flash_attn_varlen_func` has no `seqlen_q` restriction, accepts a paged
   `block_table`, and supports GQA.** This is the verify path.
-- **Latent bug:** `attention.py` never passes `block_table=` to
-  `flash_attn_varlen_func` despite the comment saying it must. Dead code today
-  (`support_prefix_cache=False` by default), but must be fixed for Phase 4.
+- **Latent bug — fixed in Phase 4, and it was worse than recorded.**
+  `attention.py` never passed `block_table=` to `flash_attn_varlen_func`. It
+  now does, but that alone would not have made prefix caching correct: the
+  kernel's causal mask is top-left anchored, so a prefix-cached prefill
+  (`seqlen_q < seqlen_k`) attends to the wrong keys regardless. The call site
+  now asserts `seqlen_q == seqlen_k` so the path fails loudly.
+- **`kv_cache_block_size` must be a multiple of 64** — both kernels resolve one
+  block-table entry per 64-key tile. Asserted in `Config` since Phase 4.
 - **The rejection-sampling maths is correct and implemented** — see Phase 2
   Results. Any later divergence from greedy is an engine-integration bug, not
   an algorithm bug. That separation is the whole point of doing Phase 2 first.
@@ -306,50 +456,70 @@ design or the algorithm either.
 
 # RESUME HERE
 
-The environment is built and Phases 0, 2, and 3 are done. **Next work is
-Phase 4: the multi-token verify pass.**
+The environment is built and Phases 0, 2, 3 and 4 are done. **Next work is
+Phase 5: rejection sampling in the engine plus bookkeeping.**
 
-### Step 0 — confirm the environment still works (2 minutes)
+### Step 0 — confirm the stack still works (5 minutes)
 
 ```
-python experiments/engine_spec_gate.py --compare --cuda-graph
+python experiments/engine_spec_gate.py --compare --cuda-graph   # GATE: PASS - byte-identical
+python experiments/verify_pass_gate.py                          # GATE: PASS
 ```
 
-Must print `GATE: PASS - byte-identical`. This exercises the whole stack —
-both models, the paged cache, flash-attention prefill and decode, CUDA graphs,
-and greedy sampling. If it fails, fix that before touching Phase 4; a broken
-backend misread as a rejection-sampling bug is the exact trap this ordering
-exists to avoid.
+The first exercises both models, the paged cache, prefill, decode, CUDA graphs
+and greedy sampling. The second exercises the Phase 4 verify pass. If either
+fails, fix it before touching Phase 5 — a broken backend misread as a
+rejection-sampling bug is the exact trap this phase ordering exists to avoid.
 
-If the environment ever needs rebuilding from scratch, the full recipe is in
-Environment State above — the load-bearing detail is **CUDA 12.6, MSVC toolset
-14.44**.
+If the environment needs rebuilding, the recipe is in Environment State above;
+the load-bearing detail is **CUDA 12.6, MSVC toolset 14.44**.
 
-### Step 1 — Phase 4
+### Step 1 — Phase 5
 
-First tasks, in order:
+The pieces are all in place: `Executor.verify()` returns
+`(num_requests, K+1, vocab_size)` logits, and `rejection_sample()` in
+`experiments/spec_decode_prototype.py` was written as a pure function
+specifically to be ported unchanged. In order:
 
-1. Fix the `block_table=` bug in `attention.py` (it is never passed to
-   `flash_attn_varlen_func` despite the comment saying it must be). This is a
-   real pre-existing correctness fix and a prerequisite for the verify pass.
-2. Run the two empirical paged-varlen checks listed at the end of
-   `docs/spec_decoding_feasibility.md`.
-3. Then build the multi-token verify pass itself.
+1. Port `rejection_sample` into `Sampler` as a **new** method. Do not touch the
+   existing `forward` — plain decode uses it.
+2. Add a draft-proposal loop. The draft shares the target's block ids
+   (Phase 3), so it can reuse `_build_decode_input` against
+   `self.draft_kv_cache`; it needs K sequential single-token steps.
+3. Wire the round into `Engine.step` / `Executor`: propose -> verify ->
+   rejection-sample -> append `num_accepted + 1` tokens. Note
+   `Scheduler.update` currently appends exactly one token per request and
+   `Metrics` assumes the same; both need to take a count.
+4. Call `allocate_block_for_decode(req, extra_tokens=K)` before each verify
+   pass — the slots for the proposals must exist before the pass writes them.
+
+Two constraints to respect, both measured:
+
+- **Keep `num_requests * (K+1) <= 5`** until the decode race is fixed. With one
+  request that means K <= 4. See the blocker section above.
+- **Do not expect byte-identical output** against non-speculative greedy once
+  speculation changes batch shapes; see "Why the gate is not byte-identical
+  greedy output". Phase 6's exit criterion needs restating.
 
 ## Phase Checklist
 
-- Phase 0: **complete — go decision recorded**, verify path identified.
-  Committed as `8f16197` on branch `test`.
+- Phase 0: **complete — go decision recorded.** Note its identified verify path
+  was wrong; corrected in Phase 4. Committed as `8f16197` on branch `test`.
 - Phase 1: deferred by design (see above); random-init draft used meanwhile.
 - Phase 2: **complete — both gates passing**, 18/18 exact match. See results above.
 - Phase 3: **complete and validated on GPU.** Config fields,
   `load_draft_model`, dual KV-cache allocation, draft checkpoint. Exit
   criterion passed byte-identically; see Phase 3 Validation.
-- Phase 4: **next, and fully unblocked.** Route verify through
-  `flash_attn_varlen_func` + `block_table`.
-- Phase 5: not started. Port `rejection_sample` from the Phase 2 prototype.
-- Phase 6: not started.
-- Phase 7: needs a trained draft model (Phase 1) to be meaningful.
+- Phase 4: **complete and gated on GPU.** `Executor.verify()` routed through
+  `flash_attn_with_kvcache` with K+1 tokens in the batch dimension — *not*
+  through `flash_attn_varlen_func`, which cannot express the shape. See Phase 4
+  Results.
+- Phase 5: **next.** Port `rejection_sample` from the Phase 2 prototype; see
+  Step 1 above.
+- Phase 6: not started. **Its exit criterion needs restating** — byte-identical
+  greedy output is not achievable in bf16 across differing batch shapes.
+- Phase 7: needs a trained draft model (Phase 1) *and* the decode race fixed,
+  since the sweep varies K and therefore batch width.
 
 ## Handoff Notes for Agents
 

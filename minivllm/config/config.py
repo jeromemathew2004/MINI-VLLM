@@ -79,6 +79,19 @@ class Config:
                 
         assert os.path.isdir(self.model), f"Model path {self.model} is not a directory."
 
+        # mini-flash-attention resolves ONE block-table entry per 64-key tile
+        # rather than per key row (csrc/mfa/{prefill,decode}.cuh; both kernels
+        # are instantiated with kBlockN=64 in csrc/mfa/flash.cu), then reads 64
+        # consecutive rows from there. A tile that straddles two pages
+        # therefore reads the second half from whatever block physically
+        # follows the first -- silently wrong attention, not a crash. Measured
+        # in experiments/paged_varlen_check.py.
+        assert self.kv_cache_block_size % 64 == 0, (
+            f"kv_cache_block_size must be a multiple of 64, got {self.kv_cache_block_size}. "
+            f"The attention kernel resolves one block-table entry per 64-key tile, so a "
+            f"smaller page silently corrupts attention for any sequence past its first page."
+        )
+
         if self.use_speculative_decoding:
             assert self.draft_model, "use_speculative_decoding requires draft_model to be set."
             self.draft_model = os.path.expanduser(self.draft_model)
