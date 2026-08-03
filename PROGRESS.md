@@ -16,8 +16,10 @@ This file is a concise handoff log for LLM agents. It tracks progress against [s
   below.
 - Phase 1 (draft model training) is **deliberately deferred** — see ordering
   note below.
-- **Phase 3 onward is blocked on the environment**, not on the design. The
-  engine cannot run on this host yet; see Environment State.
+- **Phase 3: complete and validated on GPU (2026-08-03).** The environment is
+  built, the engine runs, and the exit criterion passes byte-identically. See
+  Phase 3 Validation.
+- **Phase 4 is next and is no longer blocked.** Start at RESUME HERE.
 
 ## Phase 2 Results (2026-08-03, CPU, Qwen3-0.6B float32)
 
@@ -63,11 +65,32 @@ Design points worth carrying into the engine:
   `DynamicCache.crop()` discards rejected KV. Phase 4 must reproduce this
   inside the paged cache, where `crop` does not exist.
 
-## Phase 3 Status — written, NOT yet executed
+## Phase 3 Validation (2026-08-03, RTX 3050 4 GB, CUDA 12.6)
 
-All engine-side Phase 3 code is written and syntax-checked only. **No part of
-it has run**, because the engine cannot start on this host yet. Treat every
-claim below as unverified until `python run.py` works.
+**Executed and passing.** The code below is no longer "written but unrun".
+
+Gate: [experiments/engine_spec_gate.py](experiments/engine_spec_gate.py)
+
+```
+python experiments/engine_spec_gate.py --compare --cuda-graph
+```
+
+builds the engine twice in one process — once plain, once with
+`use_speculative_decoding=True` — and diffs the greedy token ids.
+
+- Both prompts, 64 tokens each: **token-for-token identical**, matching
+  SHA-256. Phase 3 adds no behaviour, and measurably does not.
+- Both models load ("Loading model on device...", "Loading draft model on
+  device...") and the draft cache is allocated over the same block ids.
+- `kv_cache_num_blocks` **237 → 184** once the draft's per-block cost is
+  charged against the same budget. This is the shrink the old runbook flagged
+  to watch for; it is correct behaviour, not a regression.
+- Verified identical across all three of: eager, CUDA graphs on, and draft
+  loaded. CUDA-graph decode output equals eager output exactly.
+
+Engine throughput for reference (0.6B, bf16, 4 GB laptop GPU): ~20 tok/s
+decode, TTFT ~7 s on a cold prefill. Slow, but this phase is about
+correctness — Phase 7 is where speed matters.
 
 - `Config` gains `use_speculative_decoding`, `draft_model`,
   `num_speculative_tokens`, and a derived `draft_hf_config`.
@@ -119,19 +142,71 @@ Smaller than the 10-30M non-embedding the plan specifies for the *trained*
 draft — this one exists to make the correctness harness fast, not to be
 accepted often. Dimensions are CLI flags.
 
-### Phase 3 exit criterion, still outstanding
+### Phase 3 exit criterion — MET
 
 Engine loads both models and non-speculative output is byte-identical with
-`use_speculative_decoding` on and off. Cannot be run until the environment is
-built.
+`use_speculative_decoding` on and off. Verified 2026-08-03; see Phase 3
+Validation above.
 
-## Environment State (verified 2026-08-03)
+## Environment State (BUILT — verified 2026-08-03)
 
-Partially built. Standalone experiments run; the engine does not.
+**The engine runs on this host.** `mini-flash-attention` and `triton` are
+installed and exercised on GPU; the full runbook steps 0-4 have passed.
+
+### The build recipe, exactly
+
+The one thing that matters: **CUDA Toolkit 12.6, not 13.x.** torch here is
+`2.9.1+cu126`, and `torch/utils/cpp_extension.py::_check_cuda_version` raises
+`RuntimeError` outright on a CUDA *major* version mismatch. Switching torch to
+cu130 instead is not an escape either — the driver is 566.07, and CUDA 13
+binaries need r580+.
+
+A CUDA 13.3 toolkit is also installed on this host and is simply unused; the
+two coexist without conflict. Point `CUDA_HOME` at v12.6 and ignore 13.3.
+
+1. **MSVC toolset must be pinned to 14.44.** CUDA 12.6's
+   `include/crt/host_config.h:168` rejects `_MSC_VER >= 1950`, and the default
+   compiler here is VS 2026's 14.51 (`cl` 19.51). Toolset 14.44 (`cl` 19.44) is
+   installed alongside it. Select it with:
+   `vcvarsall.bat x64 -vcvars_ver=14.44`, and set `DISTUTILS_USE_SDK=1` so
+   setuptools honours that environment instead of probing for VS itself.
+2. **`mini-flash-attention` needs three Windows fixes in its `setup.py`**
+   (upstream is Linux-only): `-std=c++20 -O3` are GCC spellings that MSVC
+   ignores with a D9002 warning and must become `/std:c++20 /O2`; and
+   `{CUDA_HOME}/lib64` does not exist on Windows, where import libraries live
+   in `lib/x64`. Its `include/cccl` entry is also absent in 12.6 (that layout
+   arrived in 12.8) but is harmless, since libcu++ sits directly under
+   `include/` there.
+3. **Clone it to a short path.** The CUTLASS submodule has filenames that blow
+   past Windows `MAX_PATH` from a deep directory; the checkout fails with
+   "Filename too long". `C:\Users\jerry\mfa-build` works. Only
+   `3rd/cutlass/include` is actually referenced, so a sparse checkout of
+   `include` at the pinned submodule SHA is enough and much faster.
+4. Set `TORCH_CUDA_ARCH_LIST=8.6` so the build targets only this GPU.
+5. Install with `pip install --no-build-isolation .` — isolation would build in
+   a fresh env without torch, and `setup.py` imports torch at module scope.
+
+The working build script is kept at `C:\Users\jerry\mfa-build\build_win.bat`.
+
+### Windows runtime gotcha: CUDA graphs
+
+`TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0` is **required** for
+`use_cuda_graph=True`. Without it, graph capture dies with
+`OverflowError: Python int too large to convert to C long` inside
+`torch/_inductor/runtime/static_cuda_launcher.py` — the static launcher passes
+a 64-bit device pointer through a C `long`, which is 32-bit on Windows (LLP64).
+`experiments/engine_spec_gate.py` sets it before importing torch. With it set,
+graphs capture fine and decode output is bit-identical to eager.
+
+`flashinfer` remains uninstalled and is still not needed: its import is lazy and
+greedy decoding takes `Sampler`'s `argmax` branch.
 
 - `.venv/` has `transformers==4.57.3`, tokenizers, safetensors, numpy, xxhash,
-  huggingface_hub. Missing for the engine: `mini-flash-attention`, `triton`,
-  `flashinfer`.
+  huggingface_hub, plus `mini_flash_attention==0.1.0` (built from source) and
+  `triton-windows==3.5.1.post24`. Python is 3.13.3.
+- **triton version is not free.** torch 2.9 pairs with triton 3.5.x; `triton-windows`
+  publishes up to 3.7.x, and taking the latest risks breaking the
+  `@torch.compile` on `MLP.forward`. Pin `3.5.1.post24`.
 - **torch: migrated and working.** `2.9.1+cu126`, `torch.cuda.is_available()`
   is **True** (confirmed 2026-08-03). The venv previously held `2.9.1+cu130`,
   which driver 566.07 cannot run. Note `requirements.txt` still pins
@@ -156,33 +231,50 @@ both provide a T4 (sm_75)**, and Kaggle's other free option is a P100
 fallback would have to be a paid A100/L4/L40S tier. The local GPU is the only
 free environment that meets the requirement.
 
-### Remaining Windows build risk
+### Windows build risk — RESOLVED
 
-The GPU is not the risk; the toolchain is.
+Every item that was listed here as a risk has been retired. `mini-flash-attention`
+compiles on MSVC and its kernel was checked numerically against
+`torch.nn.functional.scaled_dot_product_attention` (max abs error 9.2e-4 on an
+fp16 GQA case, 8 query heads / 4 KV heads, causal). The build recipe is above.
 
-- `mini-flash-attention`'s `setup.py` compiles CUTLASS with `-std=c++20`, and
-  its README documents a Linux-only build
-  (`build/lib.linux-x86_64-cpython-312`). The MSVC path is unexercised. It
-  passes no explicit `-gencode` flags, relying on torch's `CUDAExtension` to
-  target the detected arch, and it needs `$CUDA_HOME/include/cccl`.
-- Building it needs a **CUDA Toolkit** and **MSVC**, neither of which is
-  installed on this host (no `nvcc`, no Visual Studio).
-- Official `triton` ships no Windows wheels; `triton-windows` is the
-  substitute. Needed for `store_kvcache_kernel` *and* for the `@torch.compile`
-  on `MLP.forward`.
-- `flashinfer` has no reliable Windows wheel. Mitigated: its import is now
-  lazy, inside the top-k/top-p branch of `Sampler.forward`, so greedy decoding
-  — which every correctness gate uses — no longer depends on it.
-- 4 GB VRAM stays tight. `max_model_len` and `gpu_memory_utilization` will
-  need lowering for local runs.
+### Running on 4 GB — required tuning
+
+The stock `Config` **cannot start on this GPU**. Measured numbers:
+
+- 4096 MiB total, of which ~2008 MiB is already gone before the cache is sized
+  (bf16 weights ~1174 MiB, plus ~834 MiB of CUDA context and Windows desktop).
+- The warmup pass peaks at ~1188 MiB.
+- At the stock `kv_cache_block_size=256`, one block costs **28 MiB**
+  (`2 * 28 layers * 256 * 8 kv heads * 128 head dim * 2 bytes`).
+
+So `gpu_memory_utilization=0.5` leaves a 26 MiB budget against a 28 MiB block
+and trips `assert kv_cache_num_blocks > 0`. That assert now carries a message
+reporting the budget, the amount already used, the warmup peak, and the
+per-block cost, instead of failing bare.
+
+The working local profile — used by `experiments/engine_spec_gate.py`:
+
+| setting | stock | local |
+|---|---|---|
+| `kv_cache_block_size` | 256 | **64** (7 MiB/block) |
+| `gpu_memory_utilization` | 0.5 | **0.9** |
+| `max_model_len` | 4096 | **1024** |
+| `max_num_batched_tokens` | 16384 | **2048** |
+| `max_num_batched_seqs` | 512 | **8** |
+
+Dropping the block size matters more than raising utilization: 28 MiB is far
+too coarse a quantum when the whole budget is ~1.6 GB.
 
 ## What Has Been Confirmed
 
 - `Executor._build_decode_input` decodes one token per request per step.
 - `FlashAttention.forward` stores KV entries during decode and calls
   `flash_attn_with_kvcache(q.unsqueeze(1), ...)`.
-- `Sampler` only exposes the existing greedy / top-k / top-p path.
-- `Config` does not yet contain speculative-decoding fields.
+- `Sampler` only exposes the existing greedy / top-k / top-p path. Greedy is
+  reached with `temperature=1.0, top_k=0, top_p=1.0`, which leaves all three
+  tensors `None` and takes the `argmax` branch without importing flashinfer.
+- `Config` **does** now contain the speculative-decoding fields (Phase 3).
 - `flash_attn_with_kvcache` asserts `seqlen_q == 1` — confirmed, unchanged.
 - **`flash_attn_varlen_func` has no `seqlen_q` restriction, accepts a paged
   `block_table`, and supports GQA.** This is the verify path.
@@ -208,99 +300,32 @@ and still reproduced greedy output exactly, across all three K values.
 
 ## Blockers
 
-- **Phase 3+ needs a runnable engine.** Nothing in `minivllm/` can be imported
-  on this host: `attention.py` imports `triton` and `mini_flash_attention` at
-  module scope, and `Executor` hardcodes `torch.set_default_device("cuda")`.
-- No blockers on the design or the algorithm.
+**None.** The environment blocker that gated Phases 3-6 is cleared: the engine
+imports, runs, and passes its correctness gate on this host. No blockers on the
+design or the algorithm either.
 
 # RESUME HERE
 
-This is the runbook for the next session. Steps 0-3 are environment work;
-step 4 is where Phase 3 actually gets validated. **Do not skip step 3** —
-proving the engine works *without* speculative decoding first is what keeps a
-backend failure from being misread as a rejection-sampling bug.
+The environment is built and Phases 0, 2, and 3 are done. **Next work is
+Phase 4: the multi-token verify pass.**
 
-### Step 0 — prerequisites the user installs by hand
-
-These are GUI/admin installers; an agent cannot do them. Install in this
-order, so the CUDA installer can register its MSBuild integration:
-
-1. **Visual Studio Build Tools 2022**, workload "Desktop development with
-   C++" (MSVC v143 + Windows SDK). Provides `cl.exe`.
-2. **CUDA Toolkit 12.6**, matching the cu126 torch build. Driver 566.07
-   supports 12.6 natively — no driver update needed.
-
-Verify: `nvcc --version` reports 12.6, and `cl.exe` resolves from a
-Developer Command Prompt (or after running `vcvars64.bat`).
-
-### Step 1 — torch: DONE, but re-confirm
+### Step 0 — confirm the environment still works (2 minutes)
 
 ```
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python experiments/engine_spec_gate.py --compare --cuda-graph
 ```
 
-Completed 2026-08-03 — prints `2.9.1+cu126 True`. Re-run the check anyway; if
-it ever reports `cu130` or `False`, reinstall with:
+Must print `GATE: PASS - byte-identical`. This exercises the whole stack —
+both models, the paged cache, flash-attention prefill and decode, CUDA graphs,
+and greedy sampling. If it fails, fix that before touching Phase 4; a broken
+backend misread as a rejection-sampling bug is the exact trap this ordering
+exists to avoid.
 
-```
-pip install --index-url https://download.pytorch.org/whl/cu126 --force-reinstall --no-deps "torch==2.9.1+cu126"
-```
+If the environment ever needs rebuilding from scratch, the full recipe is in
+Environment State above — the load-bearing detail is **CUDA 12.6, MSVC toolset
+14.44**.
 
-Note plain `torch==2.9.1` is **not** enough — pip treats an installed
-`2.9.1+cu130` as already satisfying it and silently does nothing. The
-`+cu126` local version and `--force-reinstall` are both required.
-
-All commands in this runbook are written as single lines on purpose: this is a
-Windows/PowerShell host, where `\` is not a line-continuation character.
-
-### Step 2 — the remaining engine dependencies
-
-```sh
-pip install triton-windows        # official triton has no Windows wheels
-pip install git+https://github.com/w4096/mini-flash-attention.git
-```
-
-`triton` is needed for `store_kvcache_kernel` *and* for the `@torch.compile`
-on `MLP.forward`. `mini-flash-attention` is the risky one — see Remaining
-Windows build risk above. `flashinfer` is **not** required: its import is now
-lazy and only greedy decoding is exercised by the correctness gates.
-
-Verify: `python -c "import triton, mini_flash_attention"`.
-
-### Step 3 — prove the engine runs at all, before any spec-decode work
-
-```sh
-python run.py
-```
-
-Expect to tune for 4 GB VRAM: lower `max_model_len` and possibly raise
-`gpu_memory_utilization` in `Config`. A clean generation here is the
-precondition for everything below.
-
-### Step 4 — validate Phase 3 (the code is written; nothing has run)
-
-Its exit criterion is that loading the draft changes nothing yet:
-
-1. `Config(use_speculative_decoding=True, draft_model="~/huggingface/Qwen3-draft-random/")`
-   constructs without tripping the vocab or path asserts.
-2. The engine starts, logs both "Loading model on device..." and "Loading
-   draft model on device...", and logs the draft cache allocation.
-3. **Greedy output is byte-identical with the flag on and off.** Phase 3 adds
-   no behaviour — the draft is loaded and then ignored.
-
-Watch for: `kv_cache_num_blocks` shrinking once the draft's per-block cost is
-charged to the same budget, and `assert kv_cache_num_blocks > 0` failing if
-4 GB proves too tight.
-
-Also worth running once CUDA works, independent of the engine —
-`Config.__post_init__` imports no torch, so this can be checked even before
-step 2 lands:
-
-```
-python -c "from minivllm.config.config import Config; c = Config(use_speculative_decoding=True, draft_model='~/huggingface/Qwen3-draft-random/'); print(c.draft_hf_config.vocab_size, c.draft_hf_config.dtype, c.num_speculative_tokens)"
-```
-
-### Step 5 — Phase 4
+### Step 1 — Phase 4
 
 First tasks, in order:
 
@@ -317,20 +342,24 @@ First tasks, in order:
   Committed as `8f16197` on branch `test`.
 - Phase 1: deferred by design (see above); random-init draft used meanwhile.
 - Phase 2: **complete — both gates passing**, 18/18 exact match. See results above.
-- Phase 3: **code written, never executed.** Config fields, `load_draft_model`,
-  dual KV-cache allocation, draft checkpoint generated. Validate at step 4 of
-  the runbook before calling it done.
-- Phase 4: unblocked in design — route verify through `flash_attn_varlen_func`
-  + `block_table`; blocked in practice on the environment.
+- Phase 3: **complete and validated on GPU.** Config fields,
+  `load_draft_model`, dual KV-cache allocation, draft checkpoint. Exit
+  criterion passed byte-identically; see Phase 3 Validation.
+- Phase 4: **next, and fully unblocked.** Route verify through
+  `flash_attn_varlen_func` + `block_table`.
 - Phase 5: not started. Port `rejection_sample` from the Phase 2 prototype.
 - Phase 6: not started.
 - Phase 7: needs a trained draft model (Phase 1) to be meaningful.
 
 ## Handoff Notes for Agents
 
-- **Start at "RESUME HERE" above.** Steps 0-3 are environment, step 4 validates
-  the Phase 3 code that is already written but has never run.
+- **Start at "RESUME HERE" above.** The environment is built; next work is
+  Phase 4.
 - Read [speculative-decoding-plan.md](speculative-decoding-plan.md) first.
+- [experiments/engine_spec_gate.py](experiments/engine_spec_gate.py) is the
+  engine-level correctness gate and the fastest way to confirm the stack is
+  healthy. It carries the 4 GB config profile; the stock `Config` will not
+  start on this GPU.
 - [docs/spec_decoding_feasibility.md](docs/spec_decoding_feasibility.md) is the
   authoritative note; it records the go decision and the two remaining
   empirical checks on paged-varlen semantics.

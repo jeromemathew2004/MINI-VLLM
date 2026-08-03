@@ -77,8 +77,16 @@ class Executor:
             # a block in each and both have to come out of the same budget.
             block_bytes += self._kv_block_bytes(config.draft_hf_config)
 
-        kv_cache_num_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert kv_cache_num_blocks > 0
+        budget = int(total * config.gpu_memory_utilization - used - peak + current)
+        kv_cache_num_blocks = budget // block_bytes
+        assert kv_cache_num_blocks > 0, (
+            f"No memory left for the KV cache: budget is {budget / 2**20:.0f} MiB "
+            f"(gpu_memory_utilization={config.gpu_memory_utilization} of "
+            f"{total / 2**20:.0f} MiB total, minus {used / 2**20:.0f} MiB already used "
+            f"and a {peak / 2**20:.0f} MiB warmup peak), but one block costs "
+            f"{block_bytes / 2**20:.1f} MiB. Raise gpu_memory_utilization, or lower "
+            f"kv_cache_block_size / max_num_batched_tokens / max_model_len."
+        )
 
         kv_cache_num_blocks = min(kv_cache_num_blocks, config.kv_cache_num_blocks)
 
