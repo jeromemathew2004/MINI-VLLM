@@ -19,10 +19,18 @@ triton==3.5.1; sys_platform != "win32"
 triton-windows==3.5.1.post24; sys_platform == "win32"
 
 # Built from source (CUTLASS / C++20 CUDA). This line works as-is on Linux.
-# On Windows it does NOT: upstream setup.py uses GCC flag spellings and a
-# lib64 path that do not exist there, and the CUTLASS submodule overruns
-# MAX_PATH from a deep directory. PROGRESS.md -> Environment State has the
-# patched build recipe; install it separately there.
+#
+# WARNING: upstream has a correctness bug. Its decode kernel has a
+# shared-memory race that makes attention nondeterministic and wrong for batch
+# widths >= 6 on every platform. Apply
+# patches/mini-flash-attention-decode-race.patch before building, on Linux too
+# — installing this line as written gets you the broken kernel. See
+# patches/README.md, and verify with experiments/decode_determinism_check.py.
+#
+# On Windows this line does NOT work at all: upstream setup.py uses GCC flag
+# spellings and a lib64 path that do not exist there, and the CUTLASS submodule
+# overruns MAX_PATH from a deep directory. PROGRESS.md -> Environment State has
+# the patched build recipe; install it separately there.
 mini_flash_attention @ git+https://github.com/w4096/mini-flash-attention.git ; sys_platform != "win32"
 
 # flashinfer is required only for top-k / top-p sampling. Its import in

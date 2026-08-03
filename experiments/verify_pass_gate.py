@@ -60,17 +60,18 @@ mismatch is a hard failure unless that step's own top-2 logit gap is below the
 noise floor, i.e. a genuine tie a sub-ULP perturbation may reorder. Those are
 counted and reported, never hidden.
 
-**Why K defaults to 4 and not more.** A verify pass runs at batch width
-`num_requests * (K+1)`, and mini-vllm's decode path is nondeterministic at width
-6 and above — a pre-existing backend race, reproduced with no speculative
-decoding involved by `experiments/decode_determinism_check.py`. One request at
-K=4 is width 5, the largest width that is currently reliable. Running this gate
-at `--k 8` reports hard mismatches that belong to that bug, not to the verify
-pass. Raising K is blocked on fixing the backend.
+**A note on K.** A verify pass runs at batch width `num_requests * (K+1)`. This
+gate was originally capped at K=4 because the decode kernel was nondeterministic
+at width 6 and above; that was a backend race, since fixed by
+`patches/mini-flash-attention-decode-race.patch`, and K is no longer bounded by
+it. Verified clean at K=4, 8 and 16. If a run at higher K starts reporting hard
+mismatches, check `experiments/decode_determinism_check.py` first — that is the
+failure mode returning, not the verify pass breaking.
 
 Usage:
     python experiments/verify_pass_gate.py
-    python experiments/verify_pass_gate.py --k 8 --max-tokens 96   # fails; see above
+    python experiments/verify_pass_gate.py --k 8
+    python experiments/verify_pass_gate.py --k 16 --max-tokens 96
 """
 
 import argparse

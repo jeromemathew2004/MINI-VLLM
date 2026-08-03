@@ -24,11 +24,12 @@ This file is a concise handoff log for LLM agents. It tracks progress against [s
   steps. It is **not** built on `flash_attn_varlen_func` as the plan and the
   Phase 0 note assumed — that kernel's causal mask is top-left anchored, which
   makes the shape unusable. See Phase 4 Results.
-- **Two bugs found along the way**, one fixed here and one out of scope:
-  prefix-caching prefill was doubly broken (missing `block_table` *and* the
-  wrong mask anchoring), and **plain decode is nondeterministic at batch width
-  >= 6** — pre-existing, unrelated to speculative decoding, and now the main
-  blocker on this project's usable K and on serving generally.
+- **Two pre-existing bugs found along the way, both now addressed.**
+  Prefix-caching prefill was doubly broken (missing `block_table` *and* the
+  wrong mask anchoring), and **plain decode was nondeterministic at batch width
+  >= 6** — a shared-memory race in the backend's decode kernel, unrelated to
+  speculative decoding. The latter is root-caused and fixed; see the backend-bug
+  section. The fix is a required patch, kept in `patches/`.
 - **Phase 5 is next.** Start at RESUME HERE.
 
 ## Phase 2 Results (2026-08-03, CPU, Qwen3-0.6B float32)
@@ -253,45 +254,71 @@ because the draft was loaded and never run, leaving shapes identical.) Either
 run that gate in float32 or restate it as distributional equivalence plus
 near-tie classification, as gate 3 does here.
 
-## Blocker found: decode is nondeterministic at batch width >= 6
+## Backend bug found and FIXED: decode was nondeterministic at width >= 6
 
-**Pre-existing, unrelated to speculative decoding, reproduces on a clean
-checkout with everything in this phase stashed.** Reproduction:
+**Pre-existing, unrelated to speculative decoding — it reproduced on a clean
+checkout with everything from Phase 4 stashed.** Found while gating Phase 4,
+root-caused, fixed, and verified.
 
-```
-python experiments/decode_determinism_check.py
-```
+### The bug
 
-Calling the *same* decode step twice on the *same* requests returns different
+Calling the *same* decode step twice on the *same* requests returned different
 logits. The pass is idempotent, so they must agree bitwise. Below width 6 they
-do; at and above it they diverge by up to 21.7, and at some widths the argmax
-changes, i.e. the engine emits a different token. Identical requests batched
-together disagree with each other by the same margin.
+did; at and above it they diverged by up to 21.7, and at some widths the argmax
+changed — the engine emitted a different token. Identical requests batched
+together disagreed with each other by the same margin.
 
-Ruled out by direct experiment: the `num_splits` heuristic (pinning it to 1
-only moves which widths break), `@torch.compile` on `MLP.forward`
-(`TORCHDYNAMO_DISABLE=1`, same), and uninitialized KV cache (`zeros` and a
-constant fill, same). The kernel reproduces it standalone on random tensors
-with no engine involved, which localises it to
-`csrc/mfa/decode.cuh`. The signature — clean at low occupancy, corrupting
-unpredictably as more blocks become resident — is a missing or mis-scoped
-shared-memory barrier. Note the kernel aliases several buffers over one
-`extern __shared__` region (`decode.cuh:588`, `:628`) while `flash.cu` sizes
-that allocation for Q + K + V only.
+`flash_attention_fwd_split_kv_kernel` aliases two things over the same
+`extern __shared__` region: `warp_max_val` / `warp_expsum_val`, the cross-warp
+softmax reduction (`decode.cuh:588`), and `warp_output` (`:628`), both at
+offset 0. Every warp reads the reduction values at `:604` and `:613`, then each
+warp writes 128 floats of output from offset 0 at `:512`, clobbering them.
+**No barrier sat between the reads and the write**, so warp 0's write raced the
+other warps' reads.
 
-Consequences:
+The corruption lands on the softmax normalisation, which is why the damage was
+a *rescaled* output rather than a small perturbation. It only manifested once
+occupancy let warps drift out of lockstep — hence the batch-size dependence.
 
-- **`max_num_batched_seqs` above ~5 is not currently safe.** The 4 GB profile
-  uses 8; the stock `Config` uses 512; `benchmark/` runs far higher.
-- Existing gates pass because they run two prompts — batch width 2.
-- **It caps K.** A verify pass is width `num_requests * (K+1)`, so one request
-  at K=4 is width 5, the last safe width. `verify_pass_gate.py` is gated at
-  K=4 for this reason and fails at K=8 with mismatches that belong to this bug.
-- Phase 7's throughput sweep over K is blocked on this, not just on Phase 1.
+Three wrong suspects were eliminated first, each of which *moved* the failing
+widths without fixing anything (exactly what perturbing occupancy does to a
+scheduling-sensitive race): the `num_splits` heuristic, `@torch.compile` on
+`MLP.forward`, and uninitialized KV cache. `compute-sanitizer --tool racecheck`
+then named it outright — ~4,500 hazards per launch between `decode.cuh:512` and
+`:604`/`:613`.
 
-Fixing it means patching `mini-flash-attention` and rebuilding (recipe in
-Environment State). That is a separate piece of work and was left out of
-Phase 4 deliberately.
+### The fix
+
+One `__syncthreads()` between the reduction and the output write, kept at
+[patches/mini-flash-attention-decode-race.patch](patches/mini-flash-attention-decode-race.patch)
+with application instructions in [patches/README.md](patches/README.md). It must
+be applied to any rebuild of the backend; upstream `w4096/mini-flash-attention`
+still has the bug.
+
+Verified after rebuilding:
+
+- racecheck: 4,500 hazards -> **0**.
+- `decode_determinism_check.py`: deterministic at **every** width 1-18 through
+  the engine and 1-32 in the bare kernel, intra-batch spread `0.0000`
+  everywhere (was up to 30.5).
+- `verify_pass_gate.py`: passes at **K=4, K=8 and K=16** — 162 / 266 / 434 rows,
+  0 hard mismatches. K=8 previously failed with 6.
+- `engine_spec_gate.py --compare --cuda-graph`: still `byte-identical`.
+
+### Correction to an earlier claim
+
+An earlier revision of this file said "treat width <= 5 as safe". That was
+wrong. The race existed at **every** width and merely failed to manifest when
+few resident blocks kept the warps in lockstep. There was never a safe ceiling,
+only an unobserved one — which also means the Phase 4 gate results collected
+before the fix were "not observed to fail" rather than proven. They have since
+been re-run against the fixed backend and are clean.
+
+### Still worth knowing
+
+`max_num_batched_seqs` is no longer bounded by this, but nothing in this repo
+has yet been *tested* at the stock 512 or at the widths `benchmark/` uses. The
+determinism check covers up to 32.
 
 ## Environment State (BUILT — verified 2026-08-03)
 
@@ -493,13 +520,16 @@ specifically to be ported unchanged. In order:
 4. Call `allocate_block_for_decode(req, extra_tokens=K)` before each verify
    pass — the slots for the proposals must exist before the pass writes them.
 
-Two constraints to respect, both measured:
+Two things to respect, both measured:
 
-- **Keep `num_requests * (K+1) <= 5`** until the decode race is fixed. With one
-  request that means K <= 4. See the blocker section above.
+- **The backend patch must be applied.** `patches/README.md`. Without it decode
+  is nondeterministic above width 6 and every gate here becomes meaningless.
+  `python experiments/decode_determinism_check.py` confirms it in one run.
 - **Do not expect byte-identical output** against non-speculative greedy once
   speculation changes batch shapes; see "Why the gate is not byte-identical
-  greedy output". Phase 6's exit criterion needs restating.
+  greedy output". Phase 6's exit criterion needs restating. This is unrelated to
+  the race above and was *not* fixed by the patch — it is cuBLAS retiling the
+  linear layers per batch shape, and it remains at 0.5 absolute.
 
 ## Phase Checklist
 
@@ -518,8 +548,9 @@ Two constraints to respect, both measured:
   Step 1 above.
 - Phase 6: not started. **Its exit criterion needs restating** — byte-identical
   greedy output is not achievable in bf16 across differing batch shapes.
-- Phase 7: needs a trained draft model (Phase 1) *and* the decode race fixed,
-  since the sweep varies K and therefore batch width.
+- Phase 7: needs a trained draft model (Phase 1). No longer blocked on the
+  decode race — the verify pass is verified clean at K=4, 8 and 16, so the
+  sweep can vary K freely.
 
 ## Handoff Notes for Agents
 

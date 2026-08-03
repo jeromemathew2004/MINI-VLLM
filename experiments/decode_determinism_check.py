@@ -1,64 +1,60 @@
-"""Decode is nondeterministic for batch widths >= 6. Reproduction.
+"""Regression check: decode must be deterministic at every batch width.
 
-**This is a pre-existing engine bug, not a speculative-decoding one.** It was
-found while gating Phase 4 and reproduces on a clean checkout with no
-speculative-decoding code involved. It is recorded here because it bounds what
-any correctness gate in this repo can claim, and because it affects normal
-serving far more than it affects speculative decoding.
+**This guards a fixed backend bug.** It requires
+`patches/mini-flash-attention-decode-race.patch` to be applied to the installed
+`mini-flash-attention`. Against stock upstream this script fails from batch
+width 6 upward — see `patches/README.md`.
 
-What happens: calling the *same* decode step twice on the *same* requests
-returns different logits. The decode pass is idempotent — it rewrites identical
-KV into identical slots before attending — so two consecutive calls must agree
-bitwise. Below batch width 6 they do. At and above it they diverge, by as much
-as 20+ logits, and at some widths the argmax itself changes, which means the
-engine emits a different token.
+What it asserts: calling the *same* decode step twice on the *same* requests
+must return identical logits. The pass is idempotent — it rewrites identical KV
+into identical slots before attending — so two consecutive calls have to agree
+bitwise. Separately, N identical requests batched together must agree with each
+other.
 
-Observed on an RTX 3050 (sm_86), Qwen3-0.6B, bf16, block size 64:
+## The bug this guards against
 
-    width   repeat-call max|diff|   verdict
+Found while gating Phase 4, and unrelated to speculative decoding — it
+reproduced on a clean checkout with none of that code present.
+
+`flash_attention_fwd_split_kv_kernel` aliases two different things over the same
+`extern __shared__` region: `warp_max_val` / `warp_expsum_val` (the cross-warp
+softmax reduction, `decode.cuh:588`) and `warp_output` (`:628`), both at offset
+0. Every warp reads the reduction values at `:604` and `:613`, then each warp
+writes 128 floats of output from offset 0 at `:512`, clobbering them. No barrier
+sat between the reads and the write, so warp 0's write raced the other warps'
+reads.
+
+Because the corruption lands on the softmax normalisation, the result is a
+*rescaled* output rather than a small perturbation — logits moved by 10-30 and
+the emitted token changed. It only manifested once occupancy let warps drift out
+of lockstep, which is why it presented as batch-size-dependent nondeterminism:
+
+    width   repeat-call max|diff|   verdict        (stock upstream)
         1              0.0000       deterministic
-        2              0.0000       deterministic
-        4              0.0000       deterministic
         5              0.0000       deterministic
         6              1.1250       NONDETERMINISTIC
-        7              6.0234       NONDETERMINISTIC
         8             11.1719       NONDETERMINISTIC
        18             21.6875       NONDETERMINISTIC
 
-Ruled out, each by direct experiment:
+Three plausible culprits were ruled out by direct experiment before the real one
+was found, and they are worth recording because each *moved* the failing widths,
+which is exactly what a scheduling-sensitive race does to anything that perturbs
+occupancy:
 
 - **Not the split-KV heuristic.** `flash_attn_with_kvcache` takes `num_splits=0`,
-  which makes the backend pick a split count from `batch * heads`
-  (`csrc/mfa/api.cpp:321`). Pinning `num_splits=1` moves which widths break but
-  does not fix it.
-- **Not `@torch.compile` on `MLP.forward`.** `TORCHDYNAMO_DISABLE=1` likewise
-  only shifts the pattern.
-- **Not uninitialized KV cache.** Allocating the cache with `zeros` or a large
-  constant instead of `torch.empty` does not fix it, so the kernel is not merely
-  reading past `cache_seqlens` into garbage.
-- **Not the engine's Context construction.** The second half of this script
-  drives `flash_attn_with_kvcache` directly with random tensors and no engine,
-  and reproduces the nondeterminism there.
+  so the backend picks a split count from `batch * heads` (`api.cpp:321`).
+  Pinning it to 1 shifted the pattern without fixing it.
+- **Not `@torch.compile` on `MLP.forward`.** `TORCHDYNAMO_DISABLE=1`, likewise.
+- **Not uninitialized KV cache.** Allocating with `zeros` or a constant instead
+  of `torch.empty` did not help, so it was not merely reading past
+  `cache_seqlens` into garbage.
 
-That leaves a race inside the decode kernel itself
-(`csrc/mfa/decode.cuh`, `flash_attention_fwd_split_kv_kernel`). The pattern —
-clean at low occupancy, corrupting unpredictably as more thread blocks are
-resident, severity varying run to run — is the signature of a missing or
-mis-scoped barrier on shared memory. Note the kernel aliases several shared
-buffers over the same `extern __shared__ char smem_data[]` region
-(`decode.cuh:588` reuses the Q/score region for `warp_max_val`, `:628` for
-`warp_output`) while the launch in `csrc/mfa/flash.cu` sizes that allocation
-for Q + K + V only. Confirming the exact barrier is a task for whoever fixes the
-backend; this script's job is to make the failure reproducible.
+`compute-sanitizer --tool racecheck` then named it directly: ~4,500 hazards per
+launch between `decode.cuh:512` and `:604`/`:613`, and 0 after the one-line fix.
 
-Consequences for this repo:
-
-- `max_num_batched_seqs` above ~5 is not currently safe. The 4 GB profile in
-  `experiments/engine_spec_gate.py` uses 8; the stock `Config` uses 512.
-- Existing gates pass because they run two prompts, i.e. batch width 2.
-- A speculative verify pass has batch width `num_requests * (K+1)`, so a single
-  request at K=4 sits at width 5 — the last safe width — and K=8 does not.
-  `experiments/verify_pass_gate.py` is gated at K=4 for this reason.
+Note the "safe below width 6" framing was always wrong: the race existed at every
+width and simply did not manifest when few resident blocks kept the warps in
+lockstep. There was never a safe ceiling, only an unobserved one.
 
 Usage:
     python experiments/decode_determinism_check.py
@@ -169,17 +165,18 @@ def main() -> int:
     isolated = kernel_in_isolation()
 
     print()
-    if first_bad:
-        print(f"RESULT: decode is nondeterministic from batch width {first_bad} upward.")
-        print(f"        The kernel reproduces it without the engine: {isolated}.")
-        print("        Treat max_num_batched_seqs > "
-              f"{first_bad - 1} as unsafe until the backend is fixed.")
-    else:
-        print("RESULT: decode was deterministic at every width tested. If this "
-              "follows a backend rebuild, the race may be fixed -- re-check "
-              "the widths documented at the top of this file.")
-    # This script reports; it is not a pass/fail gate, because the bug it
-    # documents is not this project's to fix.
+    if first_bad or isolated:
+        print(f"RESULT: FAIL - decode is nondeterministic"
+              + (f" from batch width {first_bad} upward" if first_bad else "")
+              + (" (reproduced in the bare kernel too)" if isolated else "") + ".")
+        print("        Is patches/mini-flash-attention-decode-race.patch applied to "
+              "the installed")
+        print("        mini-flash-attention? See patches/README.md. Confirm with:")
+        print("          compute-sanitizer --tool racecheck --racecheck-report analysis \\")
+        print("            python <a script making one flash_attn_with_kvcache call at width 8>")
+        return 1
+
+    print("RESULT: PASS - decode is deterministic at every width tested.")
     return 0
 
 

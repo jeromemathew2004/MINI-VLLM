@@ -196,18 +196,14 @@ def check_decode_kernel_verify_shape(requests: list[dict], K: int, label: str) -
     This is the verify pass in miniature: one call, several query tokens, each
     attending to a different amount of the same paged cache.
 
-    Total batch width is kept at or below 5. Above that the decode kernel is
-    nondeterministic — a pre-existing backend race, unrelated to paging and
-    reproduced on its own by experiments/decode_determinism_check.py. Exceeding
-    it here would make this check fail intermittently for a reason that has
-    nothing to do with the question it is asking.
+    This check once had to stay at batch width <= 5, because the decode kernel
+    was nondeterministic above that and would fail this intermittently for a
+    reason unrelated to paging. That was a backend race, fixed by
+    patches/mini-flash-attention-decode-race.patch, so the ceiling is gone. If
+    this does start failing intermittently at wider shapes, run
+    experiments/decode_determinism_check.py before suspecting the paging.
     """
-    width = len(requests) * (K + 1)
-    assert width <= 5, (
-        f"{label}: batch width {width} exceeds the width-5 ceiling imposed by the "
-        f"decode-kernel race; see experiments/decode_determinism_check.py"
-    )
-
+    batch_width = len(requests) * (K + 1)
     block_size = 64
     num_blocks = 32
     generator = torch.Generator(device=DEVICE).manual_seed(2)
@@ -229,7 +225,8 @@ def check_decode_kernel_verify_shape(requests: list[dict], K: int, label: str) -
             v_cache[bid] = vc[bid]
 
     q_rows, cache_seqlens, block_rows, expected = [], [], [], []
-    width = max(len(r["blocks"]) for r in requests)
+    # Padding width of the block table, unrelated to the batch width above.
+    table_width = max(len(r["blocks"]) for r in requests)
     for req, (k, v) in zip(requests, truths):
         for j in range(K + 1):
             # Query token j of this request sits at absolute position
@@ -238,7 +235,7 @@ def check_decode_kernel_verify_shape(requests: list[dict], K: int, label: str) -
             q = torch.randn(1, NUM_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE, generator=generator)
             q_rows.append(q)
             cache_seqlens.append(pos + 1)
-            block_rows.append(req["blocks"] + [-1] * (width - len(req["blocks"])))
+            block_rows.append(req["blocks"] + [-1] * (table_width - len(req["blocks"])))
             expected.append(reference(q, k[:pos + 1], v[:pos + 1], pos))
 
     q = torch.cat(q_rows, dim=0)
@@ -253,7 +250,7 @@ def check_decode_kernel_verify_shape(requests: list[dict], K: int, label: str) -
         worst = max(worst, float((out[i:i + 1].float() - ref.float()).abs().max()))
     ok = worst < TOL
     print(f"   {label}: {len(requests)} request(s) x {K + 1} query tokens "
-          f"(batch width {width}), per-row cache_seqlens {cache_seqlens}")
+          f"(batch width {batch_width}), per-row cache_seqlens {cache_seqlens}")
     print(f"   max|err| vs dense attention = {worst:.2e}  -> {'PASS' if ok else 'FAIL'}")
     return ok
 
@@ -267,16 +264,15 @@ def main() -> int:
     q2 = check_causal_anchoring()
 
     print("\n== Q3: flash_attn_with_kvcache as the verify primitive ==")
-    # Two shapes, both within the width-5 ceiling: one request spanning three
-    # blocks with K=4, and two requests of different lengths with K=1 so the
-    # per-row cache_seqlens and per-row block table are exercised across
-    # sequences too. Block ids descend, matching what the repo's free-list
-    # hands out (deque.pop() takes the highest id first).
+    # One request spanning three blocks, and two requests of different lengths
+    # so the per-row cache_seqlens and per-row block table are exercised across
+    # sequences too. Block ids descend, matching what the repo's free-list hands
+    # out (deque.pop() takes the highest id first).
     q3_single = check_decode_kernel_verify_shape(
         [{"blocks": [9, 8, 7], "len": 130}], K=4, label="one request, K=4")
     q3_multi = check_decode_kernel_verify_shape(
-        [{"blocks": [9, 8, 7], "len": 130}, {"blocks": [5, 4], "len": 70}], K=1,
-        label="two requests, K=1")
+        [{"blocks": [9, 8, 7], "len": 130}, {"blocks": [5, 4], "len": 70}], K=4,
+        label="two requests, K=4")
     print("   => the decode kernel expresses the verify pass exactly; no backend patch needed")
 
     results = {

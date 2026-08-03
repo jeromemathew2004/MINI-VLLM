@@ -1,0 +1,24 @@
+diff --git a/csrc/mfa/decode.cuh b/csrc/mfa/decode.cuh
+index 23c363f..c6eefe4 100644
+--- a/csrc/mfa/decode.cuh
++++ b/csrc/mfa/decode.cuh
+@@ -623,6 +623,19 @@ __global__ void flash_attention_fwd_split_kv_kernel(__grid_constant__ const Forw
+         O.zero();
+     }
+ 
++    // warp_output aliases smem_data at offset 0, which is exactly where
++    // warp_max_val/warp_expsum_val live. Warp 0's copy_rmem_to_smem below
++    // writes floats 0..kHeadDim-1, clobbering all kNWarps entries of both
++    // arrays -- while the other warps may still be reading them in the
++    // reduction above. Without this barrier that is a write-after-read race on
++    // shared memory: compute-sanitizer --tool racecheck reports ~4.5k hazards
++    // per launch between decode.cuh:512 (the write) and :604 / :613 (the
++    // reads). It corrupts the softmax normalisation, so the damage is a
++    // rescaled output rather than a small perturbation, and it only shows up
++    // once occupancy lets warps drift out of lockstep -- which is why it
++    // appears as batch-size-dependent nondeterminism.
++    __syncthreads();
++
+     // Copy the normalized output from register to shared memory for reduction
+     using WarpOutLayout = Layout<Shape<Int<KernelTraits::kNWarps>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>;
+     Tensor warp_output = make_tensor(make_smem_ptr<float>(smem_data), WarpOutLayout{});
