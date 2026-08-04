@@ -14,11 +14,14 @@ This file is a concise handoff log for LLM agents. It tracks progress against [s
   [experiments/spec_decode_prototype.py](experiments/spec_decode_prototype.py)
   implements draft-and-verify on plain HF models; both gates pass. Results
   below.
-- **Phase 1 (draft model training) was deliberately deferred, and is now the
-  next work.** Correctness never needed it; acceptance rate is all it buys, and
-  that is now the only thing between this feature and a speedup. Its objective
-  is respecified — **distil from the target**, do not pretrain on a general
-  corpus. Recipe in RESUME HERE step 1.
+- **Phase 1 (draft model training) was deliberately deferred, and is now
+  OPTIONAL rather than next.** Correctness never needed it; acceptance rate is
+  all it buys. The recommended next work is an **n-gram / prompt-lookup
+  proposer** instead — half a day, no training, and it needs only ~30%
+  acceptance to pay rather than ~60%, because it removes `propose()` from the
+  round cost entirely. It also changes `Executor.propose()` and nothing else.
+  See RESUME HERE step 1. If Phase 1 is done later, its objective is respecified:
+  **distil from the target**, do not pretrain on a general corpus (step 2).
 - **Phase 3: complete and validated on GPU (2026-08-03).** The environment is
   built, the engine runs, and the exit criterion passes byte-identically. See
   Phase 3 Validation.
@@ -842,7 +845,9 @@ instruction corpus is fine because the draft's usefulness "is measured entirely
 by acceptance rate against the target, not by its own perplexity" — which is
 true, and is the reason the conclusion does not follow. If acceptance against
 the target is the metric, agreement with the target is the objective. See
-RESUME HERE step 1 for the recipe and the reasoning.
+RESUME HERE step 2 for the recipe and the reasoning. Note Phase 1 is now
+optional — see step 1 for the n-gram proposer that reaches a measured speedup
+without it.
 
 **3. Phase 4's verify mechanism** is the decode kernel with K+1 tokens in the
 batch dimension, not `flash_attn_varlen_func` — see Phase 4 Results.
@@ -880,7 +885,84 @@ run (it fails loudly if a backend rebuild dropped
 If the environment needs rebuilding, the recipe is in Environment State above;
 the load-bearing detail is **CUDA 12.6, MSVC toolset 14.44**.
 
-### Step 1 — Phase 1: train the draft, by DISTILLATION not plain pretraining
+### Step 1 (RECOMMENDED) — an n-gram proposer, instead of training a draft
+
+**This is the cheaper path to a real measured speedup, and it is probably the
+better deliverable.** Half a day, no training, no data, no GPU time. Phase 1
+(step 2 below) becomes optional rather than load-bearing.
+
+Replace the draft *model* with **prompt-lookup decoding**: match the last 2-3
+committed tokens against earlier text in `req.tokens`, and propose whatever
+followed that match last time. No parameters. It is a real production technique
+— vLLM ships it as the `[ngram]` speculative method, HF transformers as
+`prompt_lookup_num_tokens`.
+
+#### Why it fits this codebase almost for free
+
+`Executor.propose()` is the only thing that changes. It must return
+`(proposals, q)` where `q` is `(B, K, vocab)`; a lookup is a *deterministic*
+proposer, so `q` is one-hot on the proposed token — exactly the shape a greedy
+draft already returns. Which means **`verify()`, `Sampler.rejection_sample()`,
+the scheduler's multi-token commit, `Metrics`, and the whole test suite are
+untouched**, and the correctness argument already proved in Phases 5-6 carries
+over verbatim.
+
+#### Why it clears the bar far more easily
+
+`propose()` stops costing anything, and `propose()` is most of a round:
+
+| proposer | propose | round (K=4) | round/T_decode | acceptance needed |
+|---|---|---|---|---|
+| draft model | 7.3 ms | 19.9 ms | 2.24 | ~60% |
+| **n-gram** | ~0 ms | **~12.3 ms** | **~1.4** | **~30%** |
+
+On workloads with input/output overlap — summarisation, code editing, RAG,
+"rewrite this paragraph" — lookup acceptance routinely beats 30% by a wide
+margin. It also frees ~50 KV-cache blocks, since the draft model and its cache
+disappear (185 -> ~237 blocks at the local profile).
+
+#### Implementation sketch
+
+1. `Config` gains `speculative_method: "draft" | "ngram"` (and
+   `ngram_max_match_len`, say 3). `draft_model` becomes required only for
+   `"draft"`; `Executor` skips loading the draft, its KV cache and its
+   `CudaGraphRunner` under `"ngram"`. The target's runner is still sized at
+   `max_num_batched_seqs * (K+1)` — the verify pass is unchanged.
+2. `Executor.propose_ngram(requests)`: for each request, take the last `n`
+   tokens as a pattern, scan backwards through `req.tokens` for the most recent
+   earlier occurrence, and return the `K` tokens that followed it. Try `n`
+   descending from `ngram_max_match_len` to 1.
+3. **Every proposal list must be exactly K long** — `verify()` asserts uniform
+   length, since it returns a dense `(B, K+1, vocab)` tensor. On a miss, pad
+   with anything; the padding is rejected at i=0 and the round still emits one
+   token, which is the invariant that guarantees forward progress.
+4. **Skip the round entirely when no request has a match.** A no-match round
+   costs ~12.3 ms to produce the one token a plain decode step gets for 8.7 ms —
+   a ~40% loss. `Engine.step` should fall back to `executor.execute(batch)` when
+   the lookup comes up empty for every request. This is what keeps n-gram from
+   being a pessimisation on non-repetitive text.
+
+#### The honest caveat, which belongs in the README too
+
+**n-gram wins on repetitive workloads and does nothing on open-ended
+generation.** It is not a general-purpose accelerator and should not be written
+up as one. Measure both cases — one prompt set with high input/output overlap,
+one open-ended — and report both. Phase 7's chart then has something worth
+looking at: throughput vs K for two proposers across two workloads, with the
+break-even line drawn on it.
+
+That framing is also what makes this a *better* deliverable than the trained
+draft rather than a shortcut around it: two proposal strategies behind one
+verify-and-accept core, with measurements showing where each pays.
+
+### Step 2 (OPTIONAL) — Phase 1: train the draft, by DISTILLATION not plain pretraining
+
+Worth doing if you want the general-purpose case — a trained draft helps on
+open-ended generation where lookup cannot. No longer on the critical path for
+having something to show. Budget: ~1 day of active work plus 2-5 days of
+mostly-unattended compute, and **do it in sprints** — the dominant risk is "will
+acceptance clear ~50%", which a 10M-token run answers in an afternoon, not "will
+it converge".
 
 CUDA graphs for the speculative path are **done** (see the section above), so
 acceptance rate is finally the thing that decides whether the feature pays.
@@ -972,12 +1054,16 @@ Also re-run the correctness suite with the new draft — `pytest tests/ --slow`
 — since a *good* draft exercises partial-acceptance paths that neither the
 random draft (0%) nor the self-draft (~100%) reaches.
 
-### Step 2 — then Phase 7
+### Step 3 — then Phase 7
 
 Phase 7 then has something to chart. Its chart should include the **break-even
 line**, not just throughput versus K — the interesting result on this hardware
 is *why* speculation does or does not pay, and that turned out to be a story
 about launch overhead before it was ever a story about draft quality.
+
+If step 1 landed, chart **two proposers across two workloads** (one with high
+input/output overlap, one open-ended). That is the figure that explains
+something rather than just reporting a number.
 
 Calibrate expectations: a 0.6B target on a laptop GPU is close to the least
 favourable case for this technique, whose reputation comes from 7B+ models where
@@ -1003,11 +1089,13 @@ Two things to respect, both measured:
 
 - Phase 0: **complete — go decision recorded.** Note its identified verify path
   was wrong; corrected in Phase 4. Committed as `8f16197` on branch `test`.
-- Phase 1: **next, and now the binding constraint.** Correctness never needed
-  it; acceptance rate is all it buys, and acceptance rate is now the only thing
-  between this feature and a speedup. Target ~50% at K=2 / ~60% at K=4.
-  **Train it by distillation from Qwen3-0.6B, not by pretraining on a general
-  corpus** — full recipe in RESUME HERE step 1.
+- Phase 1: **optional, and no longer the recommended next step.** Acceptance
+  rate is the only thing between this feature and a speedup, but an **n-gram
+  proposer reaches that bar for half a day of work instead of a week** — it
+  needs ~30% acceptance rather than ~60%, because removing the draft model
+  removes most of the round's cost. RESUME HERE step 1. Phase 1 remains worth
+  doing for the open-ended-generation case that lookup cannot help; if so,
+  distil from Qwen3-0.6B rather than pretraining on a general corpus (step 2).
 - Phase 2: **complete — both gates passing**, 18/18 exact match. See results above.
 - Phase 3: **complete and validated on GPU.** Config fields,
   `load_draft_model`, dual KV-cache allocation, draft checkpoint. Exit
@@ -1028,14 +1116,17 @@ Two things to respect, both measured:
   criterion survives as written but as a **tolerance**: byte-identical greedy
   output holds everywhere measured, though a near-tie flip is possible and is
   not a bug. See Phase 6 Results.
-- Phase 7: needs a trained draft model (Phase 1). No longer blocked on the
-  decode race — the verify pass is verified clean at K=4, 8 and 16, so the
-  sweep can vary K freely.
+- Phase 7: needs a proposer that actually lands — either the n-gram lookup
+  (RESUME HERE step 1) or a trained draft (Phase 1). No longer blocked on the
+  decode race: the verify pass is clean at K=4, 8 and 16, so the sweep can vary
+  K freely. Chart the **break-even line** alongside throughput, and if the
+  n-gram proposer landed, chart two proposers across two workloads.
 
 ## Handoff Notes for Agents
 
 - **Start at "RESUME HERE" above.** The environment is built and speculative
-  decoding runs end to end; next work is Phase 6.
+  decoding runs end to end through Phase 6; next work is the n-gram proposer
+  (step 1), which is what stands between this and a measured speedup.
 - Read [speculative-decoding-plan.md](speculative-decoding-plan.md) first.
 - [experiments/engine_spec_gate.py](experiments/engine_spec_gate.py) is the
   engine-level correctness gate and the fastest way to confirm the stack is
@@ -1045,5 +1136,7 @@ Two things to respect, both measured:
   authoritative note; it records the go decision and the two remaining
   empirical checks on paged-varlen semantics.
 - The greedy exact-match harness is the correctness gate at every level —
-  prototype (Phase 2, done) and engine (Phase 6, pending).
+  prototype (Phase 2) and engine (Phase 6), both done. Any new proposer must
+  keep `pytest tests/ --slow` green; a proposer changes acceptance rate, never
+  output.
 - Do not modify paging or scheduler core code unless the plan is explicitly revised.
