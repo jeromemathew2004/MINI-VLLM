@@ -35,18 +35,35 @@ class Executor:
         self._init_kv_cache()
         
         self.graph_runner = None
-        if config.use_cuda_graph and config.use_speculative_decoding:
-            # Every graph is captured for one query row per request, and a
-            # speculative round runs K+1 of them, so none of them could ever be
-            # replayed. Capturing anyway would only reserve a graph pool that
-            # nothing draws from — which on a small card is memory the KV cache
-            # could have used. Plan section 7.4 calls for eager verify passes;
-            # this is that, taken to its conclusion.
-            logging.info("CUDA graphs skipped: speculative rounds run eagerly.")
-        elif config.use_cuda_graph:
+        self.draft_graph_runner = None
+        if config.use_cuda_graph:
             logging.info("Initializing CUDA graph executor...")
-            self.graph_runner = CudaGraphRunner(self.model, self.config, self.config.max_num_batched_seqs)
+
+            # A speculative round is decode-shaped — that is Phase 4's finding:
+            # a request's K+1 tokens ride in the *batch* dimension, so a verify
+            # pass over B requests is a decode call at width B*(K+1) and needs
+            # graphs captured that wide.
+            #
+            # This sizing is the difference between the feature being usable and
+            # not. Measured on the dev host, graphs are worth ~8x per decode
+            # step; an eager round costs ~15x a graphed step, which no
+            # acceptance rate can repay, since break-even would need more
+            # accepted tokens than a round even proposes. See
+            # experiments/spec_breakeven.py.
+            width = config.max_num_batched_seqs
+            if config.use_speculative_decoding:
+                width *= config.num_speculative_tokens + 1
+
+            self.graph_runner = CudaGraphRunner(self.model, config, width, label="target")
             self.graph_runner.capture()
+
+            if self.draft_model is not None:
+                # The draft contributes one row per request per proposal step,
+                # and two on the first (the catch-up row; see propose()).
+                self.draft_graph_runner = CudaGraphRunner(
+                    self.draft_model, config, 2 * config.max_num_batched_seqs,
+                    hf_config=config.draft_hf_config, label="draft")
+                self.draft_graph_runner.capture()
 
         
     @staticmethod
@@ -345,9 +362,13 @@ class Executor:
         the one most implementations get wrong and is covered explicitly by
         experiments/verify_pass_gate.py.
 
-        **CUDA graphs are bypassed.** `CudaGraphRunner` captures one query row
-        per request and a verify pass has K+1, so this calls the model eagerly.
-        Recorded as a known limitation, per plan section 7.4.
+        **CUDA graphs.** A verify pass replays the target's captured graphs like
+        any other decode-shaped call — "one query row per request" was never the
+        constraint, "one query row per *batch entry*" is, and this shape
+        satisfies it at width `num_requests * (K+1)`. `Executor.__init__` sizes
+        the runner accordingly. Without this the pass runs ~8x slower and
+        speculation cannot break even at any acceptance rate; see
+        experiments/spec_breakeven.py.
         """
         assert requests, "verify() needs at least one request"
         num_proposals = len(proposals[0])
@@ -357,7 +378,7 @@ class Executor:
         )
 
         input_ids, ctx = self._build_verify_input(requests, proposals)
-        logits = self.model(ctx, input_ids, ctx.positions)
+        logits = self._decode_forward(self.model, self.graph_runner, ctx, input_ids)
         return logits.view(len(requests), num_proposals + 1, -1)
 
     @torch.inference_mode()
@@ -417,7 +438,8 @@ class Executor:
                     rows.append([(proposal[-1], base + step)])
 
             input_ids, ctx = self._build_paged_rows(requests, rows)
-            logits = self.draft_model(ctx, input_ids, ctx.positions)
+            logits = self._decode_forward(self.draft_model, self.draft_graph_runner,
+                                          ctx, input_ids)
 
             if step == 0:
                 # Two rows per request; only the second one predicts a new token.
@@ -509,12 +531,27 @@ class Executor:
         logits = self.model(ctx, input_ids, ctx.positions)
         return logits
 
+    @staticmethod
+    def _decode_forward(model, runner, ctx: Context, input_ids: torch.Tensor) -> torch.Tensor:
+        """Run a decode-shaped pass, replaying a captured graph when one fits.
+
+        Plain decode, the draft's proposal steps and the verify pass all take
+        this route — they differ only in how many rows each request contributes.
+        Falling back to eager when the batch is wider than anything captured
+        keeps graph sizing a performance question rather than a correctness one.
+
+        When a graph is used the result is a **view of that runner's persistent
+        output buffer**, valid only until the same runner replays again. Every
+        caller here either samples from it or converts it to probabilities
+        immediately; the target and the draft have separate runners, so a round
+        interleaving them is safe.
+        """
+        if runner is not None and runner.can_replay(input_ids.size(0)):
+            return runner.replay(ctx, input_ids)
+        return model(ctx, input_ids, ctx.positions)
+
     def decode(self, ctx: Context, input_ids: torch.Tensor) -> torch.Tensor:
-        if self.graph_runner is not None and self.graph_runner.max_batch_size >= input_ids.size(0):
-            logits = self.graph_runner.replay(ctx, input_ids)
-        else:
-            logits = self.model(ctx, input_ids, ctx.positions)
-        return logits
+        return self._decode_forward(self.model, self.graph_runner, ctx, input_ids)
     
     def forward(self, ctx: Context, tokens: torch.Tensor) -> torch.Tensor:
         if ctx.prefill:

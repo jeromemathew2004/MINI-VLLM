@@ -101,8 +101,15 @@ class RoundRecorder:
         return tokens, num_accepted
 
 
-def _generate(spec: bool, draft: str, k: int, prompts):
-    engine = harness.build_engine(spec=spec, draft=draft, k=k)
+def _generate(spec: bool, draft: str, k: int, prompts, cuda_graph: bool = False):
+    engine = harness.build_engine(spec=spec, draft=draft, k=k, cuda_graph=cuda_graph)
+    if cuda_graph:
+        # Guard against the test quietly not exercising what it claims to: if
+        # graph capture were skipped, every assertion below would still pass
+        # while measuring the eager path.
+        assert engine.executor.graph_runner is not None
+        if spec:
+            assert engine.executor.draft_graph_runner is not None
     recorder = RoundRecorder(engine, k) if spec else None
 
     sampling = harness.SamplingParams(temperature=1.0, top_k=0, top_p=1.0,
@@ -126,22 +133,42 @@ def prompts():
 
 @pytest.fixture(scope="module")
 def baseline(prompts):
-    """Plain greedy decoding, speculation off. The thing to be reproduced."""
-    tokens, _, _ = _generate(False, harness.DRAFT, K, prompts)
-    return tokens
+    """Plain greedy decoding, speculation off. The thing to be reproduced.
+
+    Returns a memoising lookup rather than a single result, because a run with
+    CUDA graphs has to be compared against a *graphed* baseline. Comparing a
+    graphed speculative run against an eager baseline would fold graph-vs-eager
+    numerics into the diff and blame speculation for them.
+    """
+    cache: dict[bool, list[list[int]]] = {}
+
+    def get(cuda_graph: bool):
+        if cuda_graph not in cache:
+            cache[cuda_graph], _, _ = _generate(False, harness.DRAFT, K, prompts,
+                                                cuda_graph=cuda_graph)
+        return cache[cuda_graph]
+
+    return get
 
 
 @requires_gpu
 @pytest.mark.slow
 @pytest.mark.gpu
-def test_random_draft_reproduces_greedy(prompts, baseline):
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_random_draft_reproduces_greedy(prompts, baseline, cuda_graph):
     """Zero acceptance: every round rejects at i=0 and emits one token.
 
     The draft is useless by construction, so this is the case where a round has
     to fall all the way back to the target's own choice — and where forward
     progress depends entirely on the residual resample always being there.
+
+    Run with graphs off *and* on. Graphs are not a detail here: a speculative
+    round replays them at width `B*(K+1)` rather than `B`, which is a shape the
+    non-speculative engine never produces, and without them speculation cannot
+    break even at any acceptance rate (`experiments/spec_breakeven.py`).
     """
-    tokens, recorder, stats = _generate(True, harness.DRAFT, K, prompts)
+    tokens, recorder, stats = _generate(True, harness.DRAFT, K, prompts,
+                                        cuda_graph=cuda_graph)
 
     assert recorder.violations == []
     assert recorder.rounds > 0
@@ -150,7 +177,7 @@ def test_random_draft_reproduces_greedy(prompts, baseline):
         f"essentially never be accepted, got {stats.acceptance_rate:.1%}"
     )
     assert recorder.emitted == recorder.rounds, "zero acceptance must emit one token per round"
-    assert tokens == baseline
+    assert tokens == baseline(cuda_graph)
 
 
 @requires_gpu
@@ -184,4 +211,4 @@ def test_self_draft_reproduces_greedy(prompts, baseline):
         f"{stats.tokens_per_request_step:.2f} tokens per request per step at "
         f"{stats.acceptance_rate:.1%} acceptance — speculation is not compounding"
     )
-    assert tokens == baseline
+    assert tokens == baseline(False)

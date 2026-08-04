@@ -5,6 +5,11 @@ asks the question that decides whether it is *worth it*, and it deliberately
 runs before Phase 1 (training a draft), because the answer changes what Phase 1
 should aim at — or whether it is worth doing on this hardware at all.
 
+That ordering paid for itself immediately: the first run showed the bottleneck
+was CUDA graphs rather than draft quality, and no amount of training would have
+moved it. See PROGRESS.md. What it measures now is the acceptance rate Phase 1
+has to hit.
+
 A round costs one `propose()` (K sequential draft passes) plus one `verify()`
 (one target pass at K+1 rows per request) plus the rejection sampler, and
 returns `M+1` tokens where M is how many proposals survived. Plain decoding
@@ -33,40 +38,41 @@ in `a`, so the inversion is well defined.
 1. *Do not compare across engines built in one process.* Two `Engine`s built
    back to back report wildly different throughput for identical work, because
    the second inherits warm `torch.compile` artefacts and cuBLAS autotuning.
-   Every number in the main table below therefore comes from **one** engine,
-   with each timed path warmed on its own before it is timed.
-2. *The production baseline uses CUDA graphs and the speculative path cannot.*
-   Graphs are captured per decode batch size for one query row per request; a
-   verify pass has K+1. Comparing eager-vs-eager would quietly flatter
-   speculation, so the graph-accelerated decode step is measured too and the
-   break-even is restated against it. That second number is the honest one for
-   "should I turn this on".
+   Every number in a table below therefore comes from **one** engine, with each
+   timed path warmed on its own before it is timed.
+2. *Compare like with like on CUDA graphs.* This script's first run found the
+   speculative path running eager while the baseline was graphed, which is worth
+   ~8x per step here and made speculation lose by 15x — break-even needed more
+   accepted tokens than a round even proposes. Graphs now cover the verify and
+   propose passes, and the default table has them on for both sides. Use
+   `--compare-eager` to see the other one; do not read the eager table as a
+   result on its own, since nothing runs that way.
 
 **Cross-check the microbenchmark before believing it.** `--end-to-end` times
 `Engine.generate` instead, one configuration per process, and its numbers must
 agree with the table. They did when this was written:
 
     mode          per-step, end to end     per-step, microbenchmark
-    base_eager              76.1 ms                    68.6 ms
-    base_graph               9.4 ms                     8.7 ms
-    spec (K=4)             146.0 ms                   134.9 ms
+    base_graph               9.1 ms                     8.9 ms
+    spec_graph (K=4)        23.1 ms                    19.9 ms
+    spec_eager (K=4)       131.8 ms                   134.9 ms
 
-The end-to-end column runs a little high because it also carries scheduling and
-sampling per step, and it decodes two requests where the microbenchmark decodes
-one. The point is that the two agree on the *ratios*, which is what break-even
-depends on: eager decode is ~8x a graphed one, and a K=4 round is ~15x.
+The end-to-end column decodes two requests where the microbenchmark decodes one,
+so `spec_graph` runs a verify pass at width 10 rather than 5 and pads to a
+16-wide graph. The point is not that the columns match to the millisecond, it is
+that they agree on the *ratios*, which is all break-even depends on.
 
-Run it as three separate invocations — never in one process, per trap 1 above:
+Run it as separate invocations — never in one process, per trap 1 above:
 
-    for m in base_eager base_graph spec; do
+    for m in base_graph spec_graph spec_eager; do
         python experiments/spec_breakeven.py --end-to-end $m
     done
 
 Usage:
     python experiments/spec_breakeven.py
     python experiments/spec_breakeven.py --k 1 2 4 8 --batch 1 --context 256
-    python experiments/spec_breakeven.py --batch 4 --iters 50
-    python experiments/spec_breakeven.py --end-to-end spec
+    python experiments/spec_breakeven.py --compare-eager
+    python experiments/spec_breakeven.py --end-to-end spec_graph
 """
 
 import argparse
@@ -238,19 +244,21 @@ def measure(engine: Engine, requests: list[Request], k_values: list[int],
     return decode, rounds
 
 
-def report(decode: dict, rounds: dict, batch: int, context: int,
-           graph_decode: dict | None) -> None:
+def report(decode: dict, rounds: dict, batch: int, context: int, label: str) -> None:
+    """One self-consistent table: every number below comes from one engine.
+
+    That matters more than it looks. Plain decode and the speculative round are
+    timed in the *same* process with the same warm state, so the ratio between
+    them — which is all break-even depends on — carries no cross-engine
+    contamination.
+    """
     print(f"\n{'=' * 78}")
-    print(f"Break-even acceptance   batch={batch}  context={context} tokens")
+    print(f"Break-even acceptance   {label}   batch={batch}  context={context} tokens")
     print(f"{'=' * 78}")
 
     t1 = decode["median"]
-    print(f"\nplain decode step (eager): {t1:7.2f} ms median  "
+    print(f"\nplain decode step: {t1:7.2f} ms median  "
           f"({decode['min']:.2f} min, sd {decode['stdev']:.2f})")
-    if graph_decode is not None:
-        tg = graph_decode["median"]
-        print(f"plain decode step (CUDA graph): {tg:7.2f} ms median  "
-              f"-> graphs are {t1 / tg:.2f}x faster than eager")
 
     print(f"\n{'K':>3} {'round':>9} {'propose':>9} {'verify':>9} {'sample':>8} "
           f"{'round/T1':>9} {'need E[M]':>10} {'need acc':>9} {'max x':>7}")
@@ -274,24 +282,6 @@ def report(decode: dict, rounds: dict, batch: int, context: int,
     print("  need acc   the per-token acceptance rate that produces that E[M]")
     print("  max x      speedup at 100% acceptance — the ceiling for this K")
 
-    if graph_decode is not None:
-        tg = graph_decode["median"]
-        print(f"\n{'-' * 78}")
-        print("Against the CUDA-graph baseline, which is what production decode "
-              "actually runs.\nSpeculative rounds cannot use graphs (they are "
-              "captured for one query row per\nrequest; a round has K+1), so this "
-              "is the comparison that decides whether to\nturn the feature on:")
-        print(f"\n{'K':>3} {'round/T1_graph':>15} {'need E[M]':>10} {'need acc':>10} {'max x':>7}")
-        print(f"{'-' * 78}")
-        for k, timings in sorted(rounds.items()):
-            ratio = timings["round"]["median"] / tg
-            needed = ratio - 1.0
-            acceptance = required_acceptance(needed, k)
-            best = (k + 1) * tg / timings["round"]["median"]
-            print(f"{k:>3} {ratio:>15.2f} {needed:>10.2f} "
-                  f"{('impossible' if acceptance is None else f'{acceptance:.1%}'):>10} "
-                  f"{best:>6.2f}x")
-
 
 def end_to_end(mode: str, k: int, max_tokens: int) -> int:
     """Time `Engine.generate` for one configuration, to validate the table above.
@@ -301,8 +291,8 @@ def end_to_end(mode: str, k: int, max_tokens: int) -> int:
     `torch.compile` artefacts and cuBLAS autotuning — and this measurement
     exists precisely to be trustworthy.
     """
-    spec = mode == "spec"
-    engine = build_engine(spec=spec, k=k, cuda_graph=(mode == "base_graph"))
+    spec = mode.startswith("spec")
+    engine = build_engine(spec=spec, k=k, cuda_graph=mode.endswith("graph"))
     tokenizer = AutoTokenizer.from_pretrained(TARGET)
     prompts = chat_prompts(tokenizer)
 
@@ -342,10 +332,11 @@ def main() -> int:
                     help="tokens of KV each request holds while timing")
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--iters", type=int, default=30)
-    ap.add_argument("--no-cuda-graph-baseline", dest="graph_baseline",
-                    action="store_false",
-                    help="skip the second engine that measures graph-accelerated decode")
-    ap.add_argument("--end-to-end", choices=("base_eager", "base_graph", "spec"),
+    ap.add_argument("--compare-eager", action="store_true",
+                    help="also print the table with CUDA graphs off, for the "
+                         "before/after")
+    ap.add_argument("--end-to-end",
+                    choices=("base_eager", "base_graph", "spec_eager", "spec_graph"),
                     default=None,
                     help="instead of the table, time Engine.generate for one "
                          "configuration; run once per configuration, in separate "
@@ -362,34 +353,21 @@ def main() -> int:
     tokenizer = AutoTokenizer.from_pretrained(TARGET)
     prompt = chat_prompts(tokenizer)[0]
 
-    # One engine for every number in the main table: propose, verify and plain
-    # decode all measured against the same warm process state.
-    engine = build_engine(spec=True, k=max(args.k), cuda_graph=False)
-    requests = make_requests(engine, prompt, args.batch, args.context)
-    decode, rounds = measure(engine, requests, args.k, args.warmup, args.iters)
-    del engine, requests
-    free_gpu_memory()
+    # Graphs on by default, because that is what the engine runs and what the
+    # comparison has to be against. Both the plain decode step and the round
+    # replay captured graphs here, so the table is apples to apples.
+    modes = [(True, "CUDA graphs")]
+    if args.compare_eager:
+        modes.append((False, "eager"))
 
-    graph_decode = None
-    if args.graph_baseline:
-        # A separate engine, because Phase 5 skips graph capture when
-        # speculation is on — no captured graph could match a K+1-row verify
-        # pass, so capturing them would only reserve a pool nothing draws from.
-        engine = build_engine(spec=False, cuda_graph=True)
+    for cuda_graph, label in modes:
+        engine = build_engine(spec=True, k=max(args.k), cuda_graph=cuda_graph)
         requests = make_requests(engine, prompt, args.batch, args.context)
-        executor = engine.executor
-
-        def graph_decode_step():
-            with torch.inference_mode():
-                input_ids, ctx = executor._build_decode_input(requests)
-                executor.forward(ctx, input_ids)
-
-        assert executor.graph_runner is not None, "expected captured CUDA graphs"
-        graph_decode = timed(graph_decode_step, args.warmup, args.iters)
-        del engine, requests, executor
+        decode, rounds = measure(engine, requests, args.k, args.warmup, args.iters)
+        del engine, requests
         free_gpu_memory()
+        report(decode, rounds, args.batch, args.context, label)
 
-    report(decode, rounds, args.batch, args.context, graph_decode)
     return 0
 
 
