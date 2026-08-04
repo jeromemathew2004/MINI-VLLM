@@ -94,6 +94,13 @@ class Metrics:
         self.prefill_steps = 0
         self.decode_steps = 0
         self.decode_request_steps = 0
+        # These two were missing, which made reset() worse than useless: every
+        # derived rate mixes a token count from before the reset with a step
+        # count from after it, so tokens_per_request_step and both throughputs
+        # came out inflated. Anything that warms up and then resets — the
+        # Phase 7 sweep does exactly that — was reading nonsense.
+        self.prefill_tokens = 0
+        self.decode_tokens = 0
         self.spec_proposed = 0
         self.spec_accepted = 0
         self.spec_rounds = 0

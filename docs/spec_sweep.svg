@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 770" width="940" height="770" font-family="DejaVu Sans, Segoe UI, sans-serif">
+<style>text{fill:#1b1b1b} .ttl{font-size:14.5px;font-weight:600}.sub{font-size:12px;fill:#555} .tick{font-size:11px;fill:#555}.axis{font-size:12px;fill:#333} .note{font-size:10.5px}.leg{font-size:12px} .ar{text-anchor:end} .ae{text-anchor:end}.mid{text-anchor:middle} .box{fill:none;stroke:#cccccc;stroke-width:1}.grid{stroke:#eeeeee;stroke-width:1}.line{fill:none;stroke-width:2.4;stroke-linejoin:round}.base{stroke-width:1.6;stroke-dasharray:6 4}</style>
+<rect width="940" height="770" fill="#ffffff"/>
+<text x="40" y="38" style="font-size:19px;font-weight:700">Speculative decoding in mini-vllm: throughput vs K</text>
+<text x="40" y="60" class="sub">Qwen3-0.6B on an RTX 3050 Laptop (4 GB), bf16, CUDA graphs on, greedy decoding, 2 concurrent requests.</text>
+<text x="40" y="78" class="sub">Points at a verify width of 14 or below emitted byte-identical text; the sweep checks output hashes. Wider rounds write different KV than plain decode and cannot.</text>
+<text x="96" y="94" class="ttl">Throughput. Dashed lines are plain decode - the bar each proposer has to clear.</text>
+<rect x="96" y="108" width="700" height="240" class="box"/>
+<line x1="96" y1="348.0" x2="796" y2="348.0" class="grid"/>
+<text x="88" y="352.0" class="tick ar">0</text>
+<line x1="96" y1="300.0" x2="796" y2="300.0" class="grid"/>
+<text x="88" y="304.0" class="tick ar">57</text>
+<line x1="96" y1="252.0" x2="796" y2="252.0" class="grid"/>
+<text x="88" y="256.0" class="tick ar">113</text>
+<line x1="96" y1="204.0" x2="796" y2="204.0" class="grid"/>
+<text x="88" y="208.0" class="tick ar">170</text>
+<line x1="96" y1="156.0" x2="796" y2="156.0" class="grid"/>
+<text x="88" y="160.0" class="tick ar">226</text>
+<line x1="96" y1="108.0" x2="796" y2="108.0" class="grid"/>
+<text x="88" y="112.0" class="tick ar">283</text>
+<text x="183.5" y="368" class="tick mid">K=1</text>
+<text x="358.5" y="368" class="tick mid">K=2</text>
+<text x="533.5" y="368" class="tick mid">K=4</text>
+<text x="708.5" y="368" class="tick mid">K=8</text>
+<text x="42" y="228.0" class="axis mid" transform="rotate(-90 42 228.0)">tokens / second</text>
+<line x1="96" y1="233.8" x2="796" y2="233.8" class="base" stroke="#333333"/>
+<text x="790" y="227.8" class="note ae" fill="#333333">plain decode, repetitive</text>
+<line x1="96" y1="178.1" x2="796" y2="178.1" class="base" stroke="#888888"/>
+<text x="790" y="172.1" class="note ae" fill="#888888">plain decode, open-ended</text>
+<polyline points="183.5,201.7 358.5,183.0 533.5,141.1 708.5,146.2" class="line" stroke="#0b8457"/>
+<circle cx="183.5" cy="201.7" r="4.5" fill="#0b8457"/>
+<circle cx="358.5" cy="183.0" r="4.5" fill="#0b8457"/>
+<circle cx="533.5" cy="141.1" r="4.5" fill="#0b8457"/>
+<circle cx="708.5" cy="146.2" r="4.5" fill="#0b8457"/>
+<polyline points="183.5,183.5 358.5,191.6 533.5,187.9 708.5,185.9" class="line" stroke="#7cc4a5"/>
+<circle cx="183.5" cy="183.5" r="4.5" fill="#7cc4a5"/>
+<circle cx="358.5" cy="191.6" r="4.5" fill="#7cc4a5"/>
+<circle cx="533.5" cy="187.9" r="4.5" fill="#7cc4a5"/>
+<circle cx="708.5" cy="185.9" r="4.5" fill="#7cc4a5"/>
+<polyline points="183.5,201.7 358.5,198.7 533.5,203.5 708.5,194.2" class="line" stroke="#b3541e"/>
+<circle cx="183.5" cy="201.7" r="4.5" fill="#b3541e"/>
+<circle cx="358.5" cy="198.7" r="4.5" fill="#b3541e"/>
+<circle cx="533.5" cy="203.5" r="4.5" fill="#b3541e"/>
+<circle cx="708.5" cy="194.2" r="4.5" fill="#b3541e"/>
+<polyline points="183.5,233.5 358.5,249.0 533.5,267.9 708.5,288.2" class="line" stroke="#d9a06b"/>
+<circle cx="183.5" cy="233.5" r="4.5" fill="#d9a06b"/>
+<circle cx="358.5" cy="249.0" r="4.5" fill="#d9a06b"/>
+<circle cx="533.5" cy="267.9" r="4.5" fill="#d9a06b"/>
+<circle cx="708.5" cy="288.2" r="4.5" fill="#d9a06b"/>
+<text x="96" y="410" class="ttl">Acceptance rate. This is the number that explains the panel above.</text>
+<rect x="96" y="424" width="700" height="240" class="box"/>
+<line x1="96" y1="664.0" x2="796" y2="664.0" class="grid"/>
+<text x="88" y="668.0" class="tick ar">0%</text>
+<line x1="96" y1="616.0" x2="796" y2="616.0" class="grid"/>
+<text x="88" y="620.0" class="tick ar">20%</text>
+<line x1="96" y1="568.0" x2="796" y2="568.0" class="grid"/>
+<text x="88" y="572.0" class="tick ar">40%</text>
+<line x1="96" y1="520.0" x2="796" y2="520.0" class="grid"/>
+<text x="88" y="524.0" class="tick ar">60%</text>
+<line x1="96" y1="472.0" x2="796" y2="472.0" class="grid"/>
+<text x="88" y="476.0" class="tick ar">80%</text>
+<line x1="96" y1="424.0" x2="796" y2="424.0" class="grid"/>
+<text x="88" y="428.0" class="tick ar">100%</text>
+<text x="183.5" y="684" class="tick mid">K=1</text>
+<text x="358.5" y="684" class="tick mid">K=2</text>
+<text x="533.5" y="684" class="tick mid">K=4</text>
+<text x="708.5" y="684" class="tick mid">K=8</text>
+<text x="42" y="544.0" class="axis mid" transform="rotate(-90 42 544.0)">acceptance rate</text>
+<polyline points="183.5,461.9 358.5,481.8 533.5,469.0 708.5,514.0" class="line" stroke="#0b8457"/>
+<circle cx="183.5" cy="461.9" r="4.5" fill="#0b8457"/>
+<circle cx="358.5" cy="481.8" r="4.5" fill="#0b8457"/>
+<circle cx="533.5" cy="469.0" r="4.5" fill="#0b8457"/>
+<circle cx="708.5" cy="514.0" r="4.5" fill="#0b8457"/>
+<polyline points="183.5,544.0 358.5,604.0 533.5,622.0 708.5,644.0" class="line" stroke="#7cc4a5"/>
+<circle cx="183.5" cy="544.0" r="4.5" fill="#7cc4a5"/>
+<circle cx="358.5" cy="604.0" r="4.5" fill="#7cc4a5"/>
+<circle cx="533.5" cy="622.0" r="4.5" fill="#7cc4a5"/>
+<circle cx="708.5" cy="644.0" r="4.5" fill="#7cc4a5"/>
+<polyline points="183.5,425.9 358.5,428.2 533.5,430.8 708.5,432.0" class="line" stroke="#b3541e"/>
+<circle cx="183.5" cy="425.9" r="4.5" fill="#b3541e"/>
+<circle cx="358.5" cy="428.2" r="4.5" fill="#b3541e"/>
+<circle cx="533.5" cy="430.8" r="4.5" fill="#b3541e"/>
+<circle cx="708.5" cy="432.0" r="4.5" fill="#b3541e"/>
+<polyline points="183.5,664.0 358.5,664.0 533.5,664.0 708.5,664.0" class="line" stroke="#d9a06b"/>
+<circle cx="183.5" cy="664.0" r="4.5" fill="#d9a06b"/>
+<circle cx="358.5" cy="664.0" r="4.5" fill="#d9a06b"/>
+<circle cx="533.5" cy="664.0" r="4.5" fill="#d9a06b"/>
+<circle cx="708.5" cy="664.0" r="4.5" fill="#d9a06b"/>
+<text x="40" y="718" class="sub">Break-even is ~30% acceptance for the n-gram proposer and ~60% at K=4 for the draft path, which costs a forward pass per proposal. Below that line a round returns fewer tokens than it cost.</text>
+<rect x="40" y="735" width="13" height="4" fill="#0b8457"/>
+<text x="59" y="741" class="leg">n-gram, repetitive prompts</text>
+<rect x="239" y="735" width="13" height="4" fill="#7cc4a5"/>
+<text x="258" y="741" class="leg">n-gram, open-ended prompts</text>
+<rect x="438" y="735" width="13" height="4" fill="#b3541e"/>
+<text x="457" y="741" class="leg">draft model @ ~100% acceptance</text>
+<rect x="663" y="735" width="13" height="4" fill="#d9a06b"/>
+<text x="682" y="741" class="leg">draft model @ 0% acceptance</text>
+</svg>

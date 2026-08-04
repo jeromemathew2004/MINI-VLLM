@@ -20,6 +20,11 @@ This file is a concise handoff log for LLM agents. It tracks progress against [s
   a measured speedup** (~1.7x on repetitive text). If Phase 1 is done later its
   objective is respecified: **distil from the target**, do not pretrain on a
   general corpus (RESUME HERE step 2).
+- **Phase 7: complete (2026-08-04).** `benchmark/spec_sweep.py` +
+  `docs/spec_sweep.svg` + the README write-up. **1.81x on repetitive text at
+  K=4.** Its output-hash gate also turned up the batch-width ceiling on
+  byte-identical output — see Phase 7 Results, which is the most interesting
+  thing in this file.
 - **N-gram / prompt-lookup proposer: built, measured and gated (2026-08-04).**
   A second proposer that needs no model at all. Break-even drops from ~60% to
   ~30% acceptance, and on prompts whose answer copies the question it reaches
@@ -473,6 +478,92 @@ because it happens to prepend the working directory. Both are now verified, from
 inside the repo and from outside it. It also registers the markers and the
 `--slow` option, and sets `TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0` before
 torch is imported.
+
+## Phase 7 Results (2026-08-04) — the sweep, the chart, and one real finding
+
+`benchmark/spec_sweep.py` runs every proposer against K on two workloads, one
+configuration per process, and writes `docs/spec_sweep.svg` plus
+`benchmark/results/spec_sweep.json`. It also hashes each configuration's output
+tokens and compares them against plain decoding's, so the chart is a correctness
+gate as well as a benchmark.
+
+### The numbers (K=4 unless stated; 2 concurrent requests, graphs on)
+
+| proposer | workload | tok/s | vs plain | acceptance |
+|---|---|---|---|---|
+| plain decode | repetitive | 135 | 1.00x | — |
+| **n-gram** | repetitive | **244** | **1.81x** | 81% |
+| plain decode | open-ended | 200 | 1.00x | — |
+| n-gram | open-ended | 189 | 0.94x | 18% |
+| draft model, random init | open-ended | 94 | 0.47x | 0% |
+| draft model, self-draft | open-ended | 170 | 0.85x | 97% |
+
+The last two rows are the argument for why Phase 1 was not the cheap route to a
+speedup, and they are worth reading together. The random draft is the *cost*
+curve at the intended 42M size: 0.47x before any proposal quality exists. The
+self-draft is the *acceptance ceiling*: 97% acceptance, and still 0.85x, because
+a 0.6B draft is not cheap. A trained draft lives between them. See
+[docs/future_upgrades.md](docs/future_upgrades.md) for the full estimate.
+
+n-gram at K=1..8 on repetitive text: 1.28x, 1.44x, **1.81x**, 1.77x. The peak at
+K=4 is the tradeoff the plan predicted — too small a K wastes the opportunity,
+too large a K spends verify capacity on proposals that die after the first
+divergence.
+
+### The finding: byte-identical output has a measured batch-width ceiling
+
+The sweep's hash check fired on all three K=8 open-ended configurations. It was
+not a fluke and not a near-tie, and running it down produced the most useful
+result of the phase.
+
+**What it is not.** Not the decode-kernel race (`decode_determinism_check`
+passes at every width). Not CUDA graphs (reproduces eager). Not the K-token block
+reservation (a K=8 config whose proposer *never* fires is byte-identical). Not
+accumulated run length (K=4 is identical at 256 tokens; K=8 diverges at token 53
+regardless of budget). Not the round logic — the divergent step was itself a
+plain-decode fallback.
+
+**What it is.** A verify pass over `num_requests * (K+1)` rows is a wider GEMM
+than a decode step, and past a certain width cuBLAS retiles and the QKV
+projection writes **different K/V into the paged cache for the same token**.
+`experiments/kv_shape_drift.py` measures it:
+
+| rows/request | K | batch width | max abs dK vs decode | max abs dV |
+|---|---|---|---|---|
+| 1 | 0 | 2 | 0.000000 | 0.000000 |
+| 5 | 4 | 10 | 0.000000 | 0.000000 |
+| 7 | 6 | 14 | 0.000000 | 0.000000 |
+| **9** | **8** | **18** | **1.000000** | **1.125000** |
+| 17 | 16 | 34 | 4.000000 | 0.843750 |
+
+**Why this matters more than the logit noise already documented.** Logit noise is
+transient — the argmax may flip at a genuine tie and nothing persists. KV noise
+is *permanent*: both runs keep decoding but no longer over the same numbers, so
+they can part company arbitrarily far downstream, at a step where plain decode
+was completely certain. That is exactly what happened at token 53 with a top-2
+gap of 14.6.
+
+**The output is still correct.** Rejection sampling stays exactly
+distribution-preserving, so a wide round still emits a valid sample from the
+target — just not the same sample plain decode would have produced. Byte
+identity is a reproducibility property, not a correctness one, and above width 14
+it is unachievable at any acceptance rate.
+
+**The practical rule.** Byte-identical greedy output holds while
+`num_requests * (K+1) <= 14` on this host. At 2 concurrent requests that means
+K <= 6. The gate in `spec_sweep.py` splits mismatches accordingly rather than
+widening until everything passes, and `experiments/spec_divergence.py` classifies
+a divergence as tie / KV-drift / bug with the width checked *first*.
+
+### A methodological correction worth keeping
+
+The first version of `spec_divergence.py` classified the K=8 divergence as a hard
+mismatch on a 14.75 top-2 gap. That verdict was wrong twice over. It measured the
+gap by prefilling `prompt + tokens[:at]` and taking one step — a *third* cache
+state neither run was ever in, since a prefill and a decode walk write different
+K/V for the same tokens. And even measured correctly, the gap test only
+distinguishes "tie" from "bug" while both runs share a cache, which above the
+drift width they do not. Both traps are now documented in the script.
 
 ## N-gram Proposer (2026-08-04) — built, measured, gated
 
@@ -972,11 +1063,13 @@ design or the algorithm either.
 
 # RESUME HERE
 
-The environment is built and Phases 0, 2, 3, 4, 5 and 6 are done. Speculative
-decoding **works end to end, is guarded by a committed test suite, and is
-measurably faster** on repetitive workloads through the n-gram proposer. What
-remains is **Phase 7 (benchmark and write up)**, and optionally Phase 1 (train a
-draft) if the open-ended case is worth attacking.
+**Every phase in the plan is complete.** Phases 0 and 2-7 are done, Phase 1 is
+deliberately optional and respecified. Speculative decoding works end to end, is
+guarded by a committed test suite, is measurably faster on repetitive workloads
+through the n-gram proposer, and is written up with a chart.
+
+Remaining ideas, with the measurement justifying each, are in
+[docs/future_upgrades.md](docs/future_upgrades.md).
 
 ### Step 0 — confirm the stack still works (10 minutes)
 
@@ -1111,12 +1204,21 @@ Also re-run the correctness suite with the new draft — `pytest tests/ --slow`
 — since a *good* draft exercises partial-acceptance paths that neither the
 random draft (0%) nor the self-draft (~100%) reaches.
 
-### Step 3 (NEXT) — Phase 7
+### Step 3 — DONE: Phase 7
 
-Phase 7 already has something to chart, without step 2. Its chart should include
-the **break-even line**, not just throughput versus K — the interesting result on
-this hardware is *why* speculation does or does not pay, and that turned out to
-be a story about launch overhead before it was ever a story about draft quality.
+**Done on 2026-08-04.** `benchmark/spec_sweep.py`, `docs/spec_sweep.svg`, and
+the README's Speculative Decoding section. Results in Phase 7 Results above.
+
+What is left, in order of value, is in
+[docs/future_upgrades.md](docs/future_upgrades.md) — the distillation corpus
+(step 2 below, respecified with measured cost estimates), the batch-width
+ceiling on byte identity, top-k/top-p support, and prefix caching.
+
+The original framing for this phase, kept because it is what the chart ended up
+showing: include the **break-even line**, not just throughput versus K — the
+interesting result on this hardware is *why* speculation does or does not pay,
+and that turned out to be a story about launch overhead before it was ever a
+story about draft quality.
 
 Chart **two proposers across two workloads** (repetitive and open-ended); step 1
 landed, so both axes have real data behind them, and
@@ -1183,12 +1285,11 @@ Two things to respect, both measured:
   criterion survives as written but as a **tolerance**: byte-identical greedy
   output holds everywhere measured, though a near-tie flip is possible and is
   not a bug. See Phase 6 Results.
-- Phase 7: **next, and unblocked.** It needed a proposer that actually lands and
-  the n-gram lookup is one, so a trained draft is no longer a prerequisite. Not
-  blocked on the decode race either: the verify pass is clean at K=4, 8 and 16,
-  so the sweep can vary K freely. Chart the **break-even line** alongside
-  throughput, two proposers across two workloads, and sweep
-  `ngram_min_match_len`. RESUME HERE step 3.
+- Phase 7: **complete.** `benchmark/spec_sweep.py` sweeps four proposers against
+  K on two workloads, one process per configuration, and renders
+  `docs/spec_sweep.svg`; the README carries the write-up. Headline: **1.81x on
+  repetitive text at K=4**, 0.94x on open-ended. The sweep's output-hash check
+  found the KV batch-width ceiling — see Phase 7 Results.
 
 ## Handoff Notes for Agents
 
