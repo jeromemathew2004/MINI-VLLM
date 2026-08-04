@@ -259,12 +259,16 @@ class RoundRecorder:
 
     def _record(self, batch):
         before = [len(req.tokens) for req in batch.requests]
-        tokens, num_accepted = self._inner(batch)
+        tokens, num_accepted, num_proposed = self._inner(batch)
+        # 0 means the proposer declined and the step fell back to plain decode
+        # (n-gram only). Such a step proposed nothing, so counting K per request
+        # would understate acceptance.
+        per_request = num_proposed // len(batch.requests) if num_proposed else 0
 
         for req, length, emitted, accepted in zip(batch.requests, before, tokens, num_accepted):
             self.rounds += 1
             self.emitted += len(emitted)
-            self.proposed += self.k
+            self.proposed += per_request
             self.accepted += accepted
             self.acceptance_histogram[accepted] += 1
 
@@ -286,7 +290,7 @@ class RoundRecorder:
                     f"request {req.id}: {len(req.blocks)} blocks, needs {needed} for "
                     f"{length} tokens + {self.k} proposals")
 
-        return tokens, num_accepted
+        return tokens, num_accepted, num_proposed
 
 
 def run_engine(spec: bool, draft: str, k: int, max_tokens: int, prompts: list[list[int]]):

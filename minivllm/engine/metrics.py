@@ -18,6 +18,12 @@ class Stats:
         # tokens-per-batch-step, which would fold in the batch width and hide
         # the thing being measured.
         self.tokens_per_request_step = 0
+        # Fraction of decode steps that actually ran a round. Always 1.0 with a
+        # draft model, which proposes unconditionally, and below it with the
+        # n-gram proposer, which declines when nothing in the batch matched.
+        # Read it alongside acceptance_rate: a high acceptance rate over a
+        # handful of rounds is a different claim from one over every step.
+        self.speculation_rate = 0
 
 class Metrics:
     def __init__(self):
@@ -38,6 +44,9 @@ class Metrics:
         # sweep charts.
         self.spec_proposed = 0
         self.spec_accepted = 0
+        # Decode steps that ran a round, as opposed to falling back to a plain
+        # decode step because the proposer had nothing (n-gram only).
+        self.spec_rounds = 0
 
         self.finished_request_count = 0
         self.start_time = time.perf_counter()
@@ -72,6 +81,8 @@ class Metrics:
 
         self.spec_proposed += num_proposed
         self.spec_accepted += num_accepted
+        if num_proposed > 0:
+            self.spec_rounds += 1
 
         for req in batch.requests:
             if req.finished:
@@ -85,6 +96,7 @@ class Metrics:
         self.decode_request_steps = 0
         self.spec_proposed = 0
         self.spec_accepted = 0
+        self.spec_rounds = 0
         self.finished_request_count = 0
         self.start_time = time.perf_counter()
 
@@ -104,4 +116,6 @@ class Metrics:
         stats.acceptance_rate = self.spec_accepted / self.spec_proposed if self.spec_proposed > 0 else 0
         stats.tokens_per_request_step = (self.decode_tokens / self.decode_request_steps
                                          if self.decode_request_steps > 0 else 0)
+        stats.speculation_rate = (self.spec_rounds / self.decode_steps
+                                  if self.decode_steps > 0 else 0)
         return stats

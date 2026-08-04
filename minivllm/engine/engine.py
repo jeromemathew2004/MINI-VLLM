@@ -35,11 +35,14 @@ class Engine:
             # is never speculative: the draft has nothing to propose from until
             # the target has emitted a token, and it prefills alongside the
             # target inside Executor.execute.
-            tokens, num_accepted = self.executor.execute_speculative(batch)
+            # num_proposed comes back from the round rather than being computed
+            # here: the n-gram proposer can decline to speculate at all, in
+            # which case the round was a plain decode step and proposed nothing.
+            tokens, num_accepted, num_proposed = self.executor.execute_speculative(batch)
             committed = self.scheduler.update(batch, tokens)
             self.metrics.update(
                 batch, committed,
-                num_proposed=len(batch.requests) * self.config.num_speculative_tokens,
+                num_proposed=num_proposed,
                 num_accepted=sum(num_accepted),
             )
         else:
@@ -85,6 +88,10 @@ class Engine:
                 if self.config.use_speculative_decoding:
                     postfix["Accept"] = f"{s.acceptance_rate:4.1%}"
                     postfix["Tok/step"] = f"{s.tokens_per_request_step:4.2f}"
+                    if self.config.speculative_method == "ngram":
+                        # Only the lookup proposer ever declines to speculate,
+                        # so this is a constant 100% elsewhere and just noise.
+                        postfix["Spec"] = f"{s.speculation_rate:4.1%}"
                 pbar.set_postfix(postfix)
                 pbar.update(s.finished_requests - stats.finished_requests)
                 stats = s

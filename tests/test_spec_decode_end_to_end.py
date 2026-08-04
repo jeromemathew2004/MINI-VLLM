@@ -51,6 +51,7 @@ class RoundRecorder:
         self.rounds = 0
         self.emitted = 0
         self.accepted = 0
+        self.skipped = 0
         self.histogram = [0] * (k + 1)
         self.violations: list[str] = []
 
@@ -73,7 +74,11 @@ class RoundRecorder:
 
     def _record(self, batch):
         before = [len(req.tokens) for req in batch.requests]
-        tokens, num_accepted = self._inner(batch)
+        tokens, num_accepted, num_proposed = self._inner(batch)
+        if num_proposed == 0:
+            # The proposer declined and the step fell back to plain decode.
+            # Only the n-gram proposer does this; a draft model always proposes.
+            self.skipped += 1
 
         for req, length, emitted, accepted in zip(batch.requests, before, tokens, num_accepted):
             self.rounds += 1
@@ -98,22 +103,31 @@ class RoundRecorder:
                     f"request {req.id}: {len(req.blocks)} blocks, needs {needed} for "
                     f"{length} tokens + {self.k} proposals")
 
-        return tokens, num_accepted
+        return tokens, num_accepted, num_proposed
 
 
-def _generate(spec: bool, draft: str, k: int, prompts, cuda_graph: bool = False):
-    engine = harness.build_engine(spec=spec, draft=draft, k=k, cuda_graph=cuda_graph)
+def _generate(spec: bool, draft: str, k: int, prompts, cuda_graph: bool = False,
+              method: str = "draft", max_tokens: int = MAX_TOKENS):
+    engine = harness.build_engine(spec=spec, draft=draft, k=k, cuda_graph=cuda_graph,
+                                  method=method)
     if cuda_graph:
         # Guard against the test quietly not exercising what it claims to: if
         # graph capture were skipped, every assertion below would still pass
         # while measuring the eager path.
         assert engine.executor.graph_runner is not None
-        if spec:
+        if spec and method == "draft":
             assert engine.executor.draft_graph_runner is not None
+    if spec and method == "ngram":
+        # The lookup proposer runs no model, so there must be no draft loaded
+        # and no draft cache charged against the memory budget. Pinning it here
+        # because "it still works" would not notice a draft being loaded and
+        # ignored — it would just quietly cost ~50 KV-cache blocks.
+        assert engine.executor.draft_model is None
+        assert engine.executor.draft_kv_cache is None
     recorder = RoundRecorder(engine, k) if spec else None
 
     sampling = harness.SamplingParams(temperature=1.0, top_k=0, top_p=1.0,
-                                      max_tokens=MAX_TOKENS)
+                                      max_tokens=max_tokens)
     outputs = engine.generate(prompts, sampling, use_tqdm=False)
     stats = engine.metrics.stats()
     tokens = [o["tokens"] for o in outputs]
@@ -125,10 +139,28 @@ def _generate(spec: bool, draft: str, k: int, prompts, cuda_graph: bool = False)
     return tokens, recorder, stats
 
 
+REPETITIVE_MAX_TOKENS = 96
+
+
 @pytest.fixture(scope="module")
 def prompts():
     from transformers import AutoTokenizer
     return harness.chat_prompts(AutoTokenizer.from_pretrained(harness.TARGET))
+
+
+@pytest.fixture(scope="module")
+def repetitive_prompts():
+    """Prompts whose answer is largely a copy of the question.
+
+    The n-gram proposer only has something to propose when the text repeats, so
+    testing it on open-ended prompts would exercise its skip path and nothing
+    else. Thinking is disabled: Qwen3 spends its first few dozen tokens
+    reasoning, which would eat the whole generation budget before any copying
+    starts.
+    """
+    from transformers import AutoTokenizer
+    return harness.chat_prompts(AutoTokenizer.from_pretrained(harness.TARGET),
+                                harness.REPETITIVE_PROMPTS, enable_thinking=False)
 
 
 @pytest.fixture(scope="module")
@@ -211,4 +243,60 @@ def test_self_draft_reproduces_greedy(prompts, baseline):
         f"{stats.tokens_per_request_step:.2f} tokens per request per step at "
         f"{stats.acceptance_rate:.1%} acceptance — speculation is not compounding"
     )
+    assert tokens == baseline(False)
+
+
+@requires_gpu
+@pytest.mark.slow
+@pytest.mark.gpu
+def test_ngram_proposer_reproduces_greedy(repetitive_prompts):
+    """The lookup proposer, on the workload it is actually for.
+
+    No draft model is involved at all — proposals come from the request's own
+    token history. The correctness claim is unchanged and that is the point:
+    rejection sampling returns the target's distribution whatever the proposer
+    offers, so swapping the proposer may move the acceptance rate but must never
+    move a token.
+
+    Also asserts the proposer is *doing something*. Byte-identical output is
+    trivially satisfiable by never speculating, and since the round skips
+    whenever nothing matches, a proposer that silently matched nothing would
+    pass the identity check while being a no-op.
+    """
+    baseline, _, _ = _generate(False, harness.DRAFT, K, repetitive_prompts,
+                               max_tokens=REPETITIVE_MAX_TOKENS)
+    tokens, recorder, stats = _generate(True, None, K, repetitive_prompts,
+                                        method="ngram",
+                                        max_tokens=REPETITIVE_MAX_TOKENS)
+
+    assert recorder.violations == []
+    assert recorder.rounds > 0
+    assert stats.speculation_rate > 0.0, (
+        "every decode step declined to speculate, so this test asserted nothing "
+        "about the proposer — check ngram_min_match_len against the workload"
+    )
+    assert stats.acceptance_rate > 0.0, (
+        f"the lookup proposer was accepted {stats.acceptance_rate:.1%} of the time on "
+        f"text that copies its own prompt; at zero it is proposing but never landing, "
+        f"which is a bug in the proposal offsets rather than a bad workload"
+    )
+    assert tokens == baseline
+
+
+@requires_gpu
+@pytest.mark.slow
+@pytest.mark.gpu
+def test_ngram_proposer_reproduces_greedy_on_open_ended_text(prompts, baseline):
+    """The case the lookup proposer is *not* for, which still has to be correct.
+
+    Open-ended generation is where the tail rarely appears earlier, so this run
+    is dominated by the skip path — rounds that fall back to a plain decode step.
+    That fallback is a second code path through `execute_speculative`, and it
+    would be easy for it to double-commit or drop a token without any of the
+    round-shaped assertions noticing.
+    """
+    tokens, recorder, _ = _generate(True, None, K, prompts, method="ngram")
+
+    assert recorder.violations == []
+    assert recorder.rounds > 0
     assert tokens == baseline(False)

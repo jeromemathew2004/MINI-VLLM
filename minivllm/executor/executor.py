@@ -3,6 +3,7 @@ import logging
 
 from minivllm.config.config import Config
 from minivllm.engine.request import Request
+from minivllm.executor import ngram
 from minivllm.executor.context import Context
 from minivllm.models.loader import load_model, load_draft_model
 from minivllm.scheduler.batch import Batch
@@ -18,8 +19,13 @@ class Executor:
         self.model = load_model(config)
 
         # Loaded before _warmup_model so that the free/peak memory numbers
-        # _init_kv_cache reads already account for the draft's weights.
-        self.draft_model = load_draft_model(config) if config.use_speculative_decoding else None
+        # _init_kv_cache reads already account for the draft's weights. Stays
+        # None under speculative_method="ngram", which proposes from the
+        # request's own token history — that is most of why the n-gram round is
+        # cheaper: no second model to run, and ~50 KV-cache blocks handed back.
+        self.draft_model = (load_draft_model(config)
+                            if config.use_speculative_decoding
+                            and config.speculative_method == "draft" else None)
         self.draft_kv_cache = None
 
         # RNG for rejection sampling. None means torch's default generator;
@@ -452,14 +458,81 @@ class Executor:
 
         return proposals, torch.stack(q_rows, dim=1)
 
+    def propose_ngram(self, requests: list[Request]
+                      ) -> tuple[list[list[int]] | None, torch.Tensor | None]:
+        """Propose by looking the tail of each request up in its own history.
+
+        Same contract as `propose`: `(proposals, q)` with `q` of shape
+        `(num_requests, K, vocab_size)`. A lookup is deterministic, so `q` is
+        one-hot on the proposed token — the same thing a greedy draft returns,
+        which is why nothing downstream of here needs to know which proposer
+        ran. See `minivllm/executor/ngram.py`.
+
+        **Returns `(None, None)` when no request in the batch has a match**, and
+        the caller must then fall back to a plain decode step. This is not an
+        optimisation, it is what keeps the method from being a pessimisation:
+        measured on the dev host a round costs ~12 ms against ~9 ms for a
+        graphed decode step, so a round that can only ever emit one token loses
+        ~40%. On open-ended text the lookup misses most of the time, and
+        skipping is what bounds the damage to zero.
+
+        A batch can still be mixed — some requests matched, some did not. Those
+        get filler proposals so the batch stays rectangular (`verify` returns a
+        dense tensor and asserts uniform proposal length); filler is rejected at
+        i=0 and the round emits their one token, exactly as a plain step would.
+        """
+        num_speculative = self.config.num_speculative_tokens
+        max_match_len = self.config.ngram_max_match_len
+        min_match_len = self.config.ngram_min_match_len
+
+        proposals: list[list[int]] = []
+        any_match = False
+
+        for req in requests:
+            proposal = ngram.lookup(req.tokens, num_speculative, max_match_len,
+                                    min_match_len)
+            if proposal is None:
+                # Filler: repeating the last committed token is in-vocabulary
+                # and needs no magic constant. It is rejected unless the target
+                # itself wanted to repeat, in which case accepting it was right.
+                proposals.append([req.tokens[-1]] * num_speculative)
+            else:
+                any_match = True
+                proposals.append(proposal)
+
+        if not any_match:
+            return None, None
+
+        draft_tokens = torch.tensor(proposals, dtype=torch.int64, device="cuda")
+        q = torch.zeros(len(requests), num_speculative, self.config.hf_config.vocab_size,
+                        dtype=torch.float32, device="cuda")
+        q.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
+        return proposals, q
+
+    def _propose(self, requests: list[Request]
+                 ) -> tuple[list[list[int]] | None, torch.Tensor | None]:
+        """Dispatch to the configured proposer. `(None, None)` means "skip"."""
+        if self.config.speculative_method == "ngram":
+            return self.propose_ngram(requests)
+        return self.propose(requests)
+
     @torch.inference_mode()
-    def execute_speculative(self, batch: Batch) -> tuple[list[list[int]], list[int]]:
+    def execute_speculative(self, batch: Batch) -> tuple[list[list[int]], list[int], int]:
         """One speculative round: propose -> verify -> rejection-sample.
 
-        Returns `(tokens, num_accepted)`. `tokens[i]` is between 1 and K+1 token
-        ids for request i and `num_accepted[i]` is how many of its K proposals
-        survived; committing them is the scheduler's job, so this method leaves
-        `req.tokens` alone.
+        Returns `(tokens, num_accepted, num_proposed)`. `tokens[i]` is between 1
+        and K+1 token ids for request i and `num_accepted[i]` is how many of its
+        K proposals survived; committing them is the scheduler's job, so this
+        method leaves `req.tokens` alone.
+
+        `num_proposed` is `len(requests) * K` for a round that ran and **0 for a
+        step that degenerated into a plain decode** because the proposer had
+        nothing to offer — only the n-gram proposer can do that, and only when
+        no request in the batch matched. It is returned rather than recomputed
+        by the caller so the acceptance rate stays an honest ratio: a skipped
+        step proposed nothing and accepted nothing, and folding a phantom K
+        proposals into the denominator would understate the proposer whenever it
+        is being correctly conservative.
 
         The caller must already have reserved K tokens of slack per request with
         `allocate_block_for_decode(req, extra_tokens=K)`, because both the draft
@@ -478,13 +551,26 @@ class Executor:
                 f"gate runs."
             )
 
-        proposals, q = self.propose(requests)
+        proposals, q = self._propose(requests)
+
+        if proposals is None:
+            # Nothing to verify. Fall back to the plain decode path rather than
+            # running a round over filler: a round is ~40% more expensive than a
+            # graphed decode step, and one that cannot accept anything spends
+            # that for a single token. Shape the result like a round's so the
+            # caller has one code path.
+            tokens = self.execute(batch)
+            return [[token] for token in tokens], [0] * len(requests), 0
+
         target_logits = self.verify(requests, proposals)
         p = self.sampler.greedy_probs(target_logits)
 
         draft_tokens = torch.tensor(proposals, dtype=torch.int64, device=q.device)
         results = self.sampler.rejection_sample(draft_tokens, q, p, self.spec_generator)
-        return [tokens for tokens, _ in results], [num for _, num in results]
+        num_proposed = len(requests) * self.config.num_speculative_tokens
+        return ([tokens for tokens, _ in results],
+                [num for _, num in results],
+                num_proposed)
 
     @staticmethod
     def _build_block_table(requests: list[Request]) -> torch.Tensor:

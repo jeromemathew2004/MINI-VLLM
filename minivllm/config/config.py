@@ -49,15 +49,38 @@ class Config:
 
     # ================= speculative decoding config =================
 
-    # whether to propose tokens with a draft model and verify them with the
-    # target model, instead of decoding one token per request per step
+    # whether to propose tokens ahead of time and verify them with the target
+    # model, instead of decoding one token per request per step
     use_speculative_decoding: bool = False
 
-    # the path of the draft model. must share the target's vocabulary
+    # where the proposals come from. "draft" runs a small model K times;
+    # "ngram" looks the last few tokens up in the request's own history and
+    # proposes what followed them before, which needs no model, no KV cache and
+    # no GPU time. both feed the same verify-and-accept core, because a greedy
+    # draft and a lookup both produce a one-hot proposal distribution
+    speculative_method: str = "draft"
+
+    # the path of the draft model. must share the target's vocabulary.
+    # required by speculative_method="draft", unused by "ngram"
     draft_model: str = ""
 
-    # the number of tokens the draft model proposes per step, "K" in the
-    # literature. each step then emits between 1 and K+1 tokens per request
+    # the longest token suffix speculative_method="ngram" tries to match
+    # against the history. it works down from here, so a larger value only adds
+    # stronger matches, never removes weaker ones
+    ngram_max_match_len: int = 3
+
+    # the shortest match worth proposing from. this is a quality floor, not a
+    # performance knob: a 1-token match exists nearly everywhere, so a low floor
+    # makes the proposer speculate on almost every step regardless of evidence,
+    # and a round costs ~1.4x a plain decode step. measured on the dev host
+    # (experiments/spec_breakeven.py --end-to-end ngram_graph), 3 beat 2 on both
+    # workloads — it roughly halves how often the proposer fires while raising
+    # acceptance, and the rounds it drops were the losing ones. both sides of
+    # that trade are reported by Metrics as speculation_rate and acceptance_rate
+    ngram_min_match_len: int = 3
+
+    # the number of tokens proposed per step, "K" in the literature. each step
+    # then emits between 1 and K+1 tokens per request
     num_speculative_tokens: int = 4
 
     # the huggingface config of the draft model
@@ -93,10 +116,25 @@ class Config:
         )
 
         if self.use_speculative_decoding:
-            assert self.draft_model, "use_speculative_decoding requires draft_model to be set."
+            assert self.speculative_method in ("draft", "ngram"), (
+                f"unknown speculative_method {self.speculative_method!r}; "
+                f"expected 'draft' or 'ngram'."
+            )
+            assert self.num_speculative_tokens >= 1, "num_speculative_tokens must be at least 1."
+
+        if self.use_speculative_decoding and self.speculative_method == "ngram":
+            assert 1 <= self.ngram_min_match_len <= self.ngram_max_match_len, (
+                f"need 1 <= ngram_min_match_len ({self.ngram_min_match_len}) <= "
+                f"ngram_max_match_len ({self.ngram_max_match_len})."
+            )
+            # Nothing else to set up: the proposer is a search over
+            # `req.tokens`, so there is no second model to load, no second KV
+            # cache to charge against the memory budget and no draft config.
+
+        if self.use_speculative_decoding and self.speculative_method == "draft":
+            assert self.draft_model, "speculative_method='draft' requires draft_model to be set."
             self.draft_model = os.path.expanduser(self.draft_model)
             assert os.path.isdir(self.draft_model), f"Draft model path {self.draft_model} is not a directory."
-            assert self.num_speculative_tokens >= 1, "num_speculative_tokens must be at least 1."
 
             self.draft_hf_config = AutoConfig.from_pretrained(self.draft_model)
 

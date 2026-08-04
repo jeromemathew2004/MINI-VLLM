@@ -36,6 +36,18 @@ PROMPTS = [
     "How do I get started with LLMs?",
 ]
 
+# Open-ended generation is the worst case for the n-gram proposer and the best
+# case for exercising its skip path; this is the other end — prompts whose
+# answer is largely a copy of the prompt, which is where prompt-lookup earns its
+# keep. Kept here rather than in the test so the experiment scripts measure the
+# same two workloads the regression suite does.
+REPETITIVE_PROMPTS = [
+    "Repeat the following sentence exactly five times, one per line, with no "
+    "commentary: The quick brown fox jumps over the lazy dog.",
+    "Echo this list back to me verbatim and in the same order, one item per "
+    "line: alpha, bravo, charlie, delta, echo, foxtrot, golf, hotel.",
+]
+
 # Greedy: temperature 1.0 with top_k 0 and top_p 1.0 leaves all three tensors
 # None in Sampler.forward, which takes the argmax branch and never imports
 # flashinfer (no reliable Windows wheel). It is also the only sampling policy
@@ -55,7 +67,9 @@ def missing_requirements(draft: str | None = None) -> str:
 
 
 def build_config(spec: bool = False, draft: str = DRAFT, k: int = 4,
-                 cuda_graph: bool = False) -> Config:
+                 cuda_graph: bool = False, method: str = "draft",
+                 ngram_min_match: int | None = None,
+                 ngram_max_match: int | None = None) -> Config:
     """The 4 GB RTX 3050 profile.
 
     The stock `kv_cache_block_size` of 256 costs 28 MiB per block for
@@ -67,7 +81,17 @@ def build_config(spec: bool = False, draft: str = DRAFT, k: int = 4,
     CUDA graphs default off: they are a decode-path optimisation already shown
     equivalent to eager in Phase 3, and leaving them out keeps the number of
     variables under test down.
+
+    The n-gram match bounds default to None rather than to a number, so the
+    tests exercise whatever `Config` actually ships. Duplicating the default
+    here would let the two drift and leave the shipped configuration untested.
     """
+    ngram_bounds = {}
+    if ngram_min_match is not None:
+        ngram_bounds["ngram_min_match_len"] = ngram_min_match
+    if ngram_max_match is not None:
+        ngram_bounds["ngram_max_match_len"] = ngram_max_match
+
     return Config(
         model=TARGET,
         max_model_len=1024,
@@ -77,25 +101,38 @@ def build_config(spec: bool = False, draft: str = DRAFT, k: int = 4,
         gpu_memory_utilization=0.9,
         use_cuda_graph=cuda_graph,
         use_speculative_decoding=spec,
-        draft_model=draft if spec else "",
+        speculative_method=method,
+        draft_model=draft if spec and method == "draft" else "",
         num_speculative_tokens=k,
+        **ngram_bounds,
     )
 
 
 def build_engine(spec: bool = False, draft: str = DRAFT, k: int = 4,
-                 cuda_graph: bool = False) -> Engine:
+                 cuda_graph: bool = False, method: str = "draft",
+                 ngram_min_match: int | None = None,
+                 ngram_max_match: int | None = None) -> Engine:
     # Collect first, unconditionally. A previously-built engine may still be
     # holding its weights and cache through a reference cycle, and on a 4 GB
     # card that is the difference between sizing a KV cache and failing to.
     free_gpu_memory()
-    return Engine(build_config(spec, draft, k, cuda_graph))
+    return Engine(build_config(spec, draft, k, cuda_graph, method,
+                               ngram_min_match, ngram_max_match))
 
 
-def chat_prompts(tokenizer, prompts: list[str] = PROMPTS) -> list[list[int]]:
+def chat_prompts(tokenizer, prompts: list[str] = PROMPTS,
+                 enable_thinking: bool = True) -> list[list[int]]:
+    """Tokenised chat prompts.
+
+    `enable_thinking=False` for the repetitive set: Qwen3 spends its first few
+    dozen tokens reasoning, and a short generation budget would be consumed
+    entirely by the think block, leaving no copied text for a lookup proposer to
+    find and nothing for the workload to actually measure.
+    """
     return [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": p}],
-            tokenize=True, add_generation_prompt=True, enable_thinking=True)
+            tokenize=True, add_generation_prompt=True, enable_thinking=enable_thinking)
         for p in prompts
     ]
 

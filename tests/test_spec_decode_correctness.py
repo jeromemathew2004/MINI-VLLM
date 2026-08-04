@@ -273,6 +273,64 @@ def test_verify_with_no_proposals_matches_decode_bitwise(engine, prompt):
 
 @requires_gpu
 @pytest.mark.gpu
+def test_ngram_proposer_matches_the_draft_models_contract(engine):
+    """`propose_ngram` must be indistinguishable from a greedy draft downstream.
+
+    That is the entire reason the n-gram proposer needed no changes to
+    `verify()`, `rejection_sample()` or the scheduler: a lookup is deterministic,
+    so its `q` is one-hot on the token it proposed, which is exactly what
+    `Sampler.greedy_probs` returns for a draft model. If that stopped holding —
+    say `q` were left as counts, or built off a stale proposal list — rejection
+    sampling would silently compare the wrong probabilities and the output would
+    drift from greedy without anything raising.
+
+    Runs on the plain (non-speculative) engine: the proposer reads `req.tokens`
+    and nothing else, so it needs no draft model and no second engine build.
+    """
+    from minivllm.engine.request import Request
+
+    matching = Request([1, 2, 3, 4, 5, 1, 2, 3], harness.GREEDY)
+    # Strictly increasing, so no token — let alone any pair — ever repeats.
+    missing = Request(list(range(200, 260)), harness.GREEDY)
+
+    proposals, q = engine.executor.propose_ngram([matching, missing])
+    k = engine.config.num_speculative_tokens
+
+    assert proposals[0] == [4, 5, 1, 2][:k]
+    # A miss still contributes K tokens: verify() returns a dense
+    # (batch, K+1, vocab) tensor and asserts uniform proposal length, so a
+    # ragged batch would not survive it. Filler is rejected at i=0.
+    assert len(proposals[1]) == k
+
+    assert q.shape == (2, k, engine.config.hf_config.vocab_size)
+    # device="cpu" spelled out: building the engine set torch's default device
+    # to cuda as a global side effect (see the note at the top of this file).
+    assert torch.equal(q.argmax(-1).cpu(), torch.tensor(proposals, device="cpu"))
+    assert torch.equal(q.sum(-1).cpu(), torch.ones(2, k, device="cpu"))
+
+
+@requires_gpu
+@pytest.mark.gpu
+def test_ngram_proposer_declines_when_nothing_matches(engine):
+    """No match anywhere in the batch means no round at all.
+
+    Not an optimisation: a round costs ~1.4x a graphed decode step, so
+    speculating on filler that cannot be accepted is a straight loss. The
+    `(None, None)` return is what `execute_speculative` falls back on, and it is
+    the only thing keeping the lookup proposer from being a pessimisation on
+    open-ended text.
+    """
+    from minivllm.engine.request import Request
+
+    proposals, q = engine.executor.propose_ngram(
+        [Request(list(range(200, 260)), harness.GREEDY)])
+
+    assert proposals is None
+    assert q is None
+
+
+@requires_gpu
+@pytest.mark.gpu
 @pytest.mark.parametrize("num_correct", range(K + 1))
 def test_round_emits_what_greedy_decoding_would(engine, prompt, anchors, noise_floor,
                                                 num_correct):

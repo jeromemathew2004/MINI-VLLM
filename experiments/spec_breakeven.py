@@ -68,11 +68,20 @@ Run it as separate invocations — never in one process, per trap 1 above:
         python experiments/spec_breakeven.py --end-to-end $m
     done
 
+**Two proposers.** `--method ngram` times the prompt-lookup proposer instead of
+the draft model. It changes only the left-hand side — `propose()` stops costing a
+forward pass — so the same algebra applies with a much smaller round, and the
+break-even acceptance drops accordingly. Its acceptance rate, unlike a draft
+model's, is a property of the *workload*, which is why `--end-to-end` takes a
+`--workload` and why quoting a single number for it would be dishonest.
+
 Usage:
     python experiments/spec_breakeven.py
+    python experiments/spec_breakeven.py --method ngram
     python experiments/spec_breakeven.py --k 1 2 4 8 --batch 1 --context 256
     python experiments/spec_breakeven.py --compare-eager
     python experiments/spec_breakeven.py --end-to-end spec_graph
+    python experiments/spec_breakeven.py --end-to-end ngram_graph --workload repetitive
 """
 
 import argparse
@@ -97,6 +106,7 @@ from minivllm.scheduler.batch import Batch  # noqa: E402
 
 from tests.spec_harness import (  # noqa: E402
     GREEDY,
+    REPETITIVE_PROMPTS,
     TARGET,
     build_engine,
     chat_prompts,
@@ -182,11 +192,21 @@ def make_requests(engine: Engine, prompt_tokens: list[int], batch: int,
 
     Afterwards each request is in the state a decode step assumes: the cache
     holds `req.tokens[:-1]` and the last committed token is unprocessed.
+
+    **The last token continues the cycle rather than being the model's own.**
+    That is the one place identity is not irrelevant: the n-gram proposer
+    searches `req.tokens`, and a model-chosen token would leave the tail
+    unmatched and send every round down the skip path, timing a plain decode
+    step and labelling it a round. What belongs in this table is the cost of a
+    round that *runs*; how often one runs is a property of a workload and is
+    measured by `--end-to-end --workload`, not here. The prefill still executes,
+    so the KV cache is real either way.
     """
     assert context > len(prompt_tokens), (
         f"context {context} must exceed the prompt's {len(prompt_tokens)} tokens"
     )
     filler = (prompt_tokens * (context // len(prompt_tokens) + 1))[:context - 1]
+    next_in_cycle = prompt_tokens[len(filler) % len(prompt_tokens)]
 
     requests = []
     for _ in range(batch):
@@ -194,8 +214,8 @@ def make_requests(engine: Engine, prompt_tokens: list[int], batch: int,
         engine.scheduler.submit(req)
         batch_obj = engine.scheduler.schedule()
         assert batch_obj is not None and batch_obj.type == Batch.PREFILL
-        token = engine.executor.execute(batch_obj)[batch_obj.requests.index(req)]
-        req.append_output_token(token)
+        engine.executor.execute(batch_obj)
+        req.append_output_token(next_in_cycle)
         requests.append(req)
 
     assert all(len(r.tokens) == context for r in requests)
@@ -229,13 +249,22 @@ def measure(engine: Engine, requests: list[Request], k_values: list[int],
             block_manager.allocate_block_for_decode(req, extra_tokens=k)
 
         batch = Batch(Batch.DECODE, requests)
-        proposals, q = executor.propose(requests)
+        # _propose rather than propose: it dispatches on speculative_method, so
+        # the same table can be produced for the n-gram proposer. Its filler
+        # text repeats by construction (make_requests cycles the prompt), so the
+        # lookup always matches and the round never takes the skip path — which
+        # is what we want here, since the skip path costs a plain decode step
+        # and would flatter the round's timing.
+        proposals, q = executor._propose(requests)
+        assert proposals is not None, (
+            "the proposer declined on every request, so there is no round to time"
+        )
         p = executor.sampler.greedy_probs(executor.verify(requests, proposals))
         draft_tokens = torch.tensor(proposals, dtype=torch.int64, device=q.device)
 
         rounds[k] = {
             "round": timed(lambda: executor.execute_speculative(batch), warmup, iters),
-            "propose": timed(lambda: executor.propose(requests), warmup, iters),
+            "propose": timed(lambda: executor._propose(requests), warmup, iters),
             "verify": timed(lambda: executor.verify(requests, proposals), warmup, iters),
             "sample": timed(
                 lambda: executor.sampler.rejection_sample(draft_tokens, q, p), warmup, iters),
@@ -283,18 +312,30 @@ def report(decode: dict, rounds: dict, batch: int, context: int, label: str) -> 
     print("  max x      speedup at 100% acceptance — the ceiling for this K")
 
 
-def end_to_end(mode: str, k: int, max_tokens: int) -> int:
+def end_to_end(mode: str, k: int, max_tokens: int, workload: str,
+               ngram_min_match: int | None, ngram_max_match: int | None) -> int:
     """Time `Engine.generate` for one configuration, to validate the table above.
 
     One configuration per process on purpose. Two engines built back to back in
     one process do not produce comparable numbers — the second inherits warm
     `torch.compile` artefacts and cuBLAS autotuning — and this measurement
     exists precisely to be trustworthy.
+
+    `workload` matters for the n-gram proposer and only for it. A draft model
+    proposes from the same weights whatever the text is; a lookup proposer has
+    nothing to propose unless the text repeats, so quoting one number for it
+    would be quoting the workload rather than the method.
     """
-    spec = mode.startswith("spec")
-    engine = build_engine(spec=spec, k=k, cuda_graph=mode.endswith("graph"))
+    spec = mode.startswith(("spec", "ngram"))
+    method = "ngram" if mode.startswith("ngram") else "draft"
+    engine = build_engine(spec=spec, k=k, cuda_graph=mode.endswith("graph"),
+                          method=method, ngram_min_match=ngram_min_match,
+                          ngram_max_match=ngram_max_match)
     tokenizer = AutoTokenizer.from_pretrained(TARGET)
-    prompts = chat_prompts(tokenizer)
+    if workload == "repetitive":
+        prompts = chat_prompts(tokenizer, REPETITIVE_PROMPTS, enable_thinking=False)
+    else:
+        prompts = chat_prompts(tokenizer)
 
     # A short throwaway run first: the first generate pays for compilation and
     # autotuning, which is exactly the contamination this mode is guarding.
@@ -313,12 +354,16 @@ def end_to_end(mode: str, k: int, max_tokens: int) -> int:
     stats = engine.metrics.stats()
     steps = engine.metrics.decode_steps
 
-    print(f"\n{mode:12s} {tokens:4d} tokens in {wall:6.2f}s = {tokens / wall:7.1f} tok/s")
+    print(f"\n{mode:12s} [{workload}] {tokens:4d} tokens in {wall:6.2f}s = "
+          f"{tokens / wall:7.1f} tok/s")
     print(f"             {steps} decode steps -> {engine.metrics.decode_time / steps * 1000:.1f} ms "
           f"per step")
     if spec:
         print(f"             acceptance {stats.acceptance_rate:.1%}, "
               f"{stats.tokens_per_request_step:.2f} tokens per request per step")
+        if method == "ngram":
+            print(f"             speculated on {stats.speculation_rate:.1%} of decode "
+                  f"steps; the rest found no match and fell back to plain decode")
     return 0
 
 
@@ -335,20 +380,35 @@ def main() -> int:
     ap.add_argument("--compare-eager", action="store_true",
                     help="also print the table with CUDA graphs off, for the "
                          "before/after")
+    ap.add_argument("--method", choices=("draft", "ngram"), default="draft",
+                    help="proposer to time: a draft model, or the n-gram lookup")
     ap.add_argument("--end-to-end",
-                    choices=("base_eager", "base_graph", "spec_eager", "spec_graph"),
+                    choices=("base_eager", "base_graph", "spec_eager", "spec_graph",
+                             "ngram_eager", "ngram_graph"),
                     default=None,
                     help="instead of the table, time Engine.generate for one "
                          "configuration; run once per configuration, in separate "
                          "processes, to validate the table")
+    ap.add_argument("--workload", choices=("open", "repetitive"), default="open",
+                    help="--end-to-end only: open-ended prompts, or prompts whose "
+                         "answer copies the question. only the n-gram proposer is "
+                         "sensitive to this, which is the point of measuring both")
     ap.add_argument("--max-tokens", type=int, default=64,
                     help="--end-to-end only: tokens to generate per prompt")
+    ap.add_argument("--ngram-max-match", type=int, default=None,
+                    help="longest match the n-gram proposer will look for "
+                         "(default: whatever Config ships)")
+    ap.add_argument("--ngram-min-match", type=int, default=None,
+                    help="shortest match the n-gram proposer will propose from. "
+                         "this is the coverage/acceptance dial: raising it means "
+                         "fewer rounds on better evidence (default: Config's)")
     args = ap.parse_args()
 
     assert torch.cuda.is_available(), "this measurement needs the GPU"
 
     if args.end_to_end:
-        return end_to_end(args.end_to_end, max(args.k), args.max_tokens)
+        return end_to_end(args.end_to_end, max(args.k), args.max_tokens,
+                          args.workload, args.ngram_min_match, args.ngram_max_match)
 
     tokenizer = AutoTokenizer.from_pretrained(TARGET)
     prompt = chat_prompts(tokenizer)[0]
@@ -361,7 +421,11 @@ def main() -> int:
         modes.append((False, "eager"))
 
     for cuda_graph, label in modes:
-        engine = build_engine(spec=True, k=max(args.k), cuda_graph=cuda_graph)
+        label = f"{args.method}, {label}"
+        engine = build_engine(spec=True, k=max(args.k), cuda_graph=cuda_graph,
+                              method=args.method,
+                              ngram_min_match=args.ngram_min_match,
+                              ngram_max_match=args.ngram_max_match)
         requests = make_requests(engine, prompt, args.batch, args.context)
         decode, rounds = measure(engine, requests, args.k, args.warmup, args.iters)
         del engine, requests
