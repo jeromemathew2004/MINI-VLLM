@@ -16,12 +16,16 @@ This file is a concise handoff log for LLM agents. It tracks progress against [s
   below.
 - **Phase 1 (draft model training) was deliberately deferred, and is now
   OPTIONAL rather than next.** Correctness never needed it; acceptance rate is
-  all it buys. The recommended next work is an **n-gram / prompt-lookup
-  proposer** instead — half a day, no training, and it needs only ~30%
-  acceptance to pay rather than ~60%, because it removes `propose()` from the
-  round cost entirely. It also changes `Executor.propose()` and nothing else.
-  See RESUME HERE step 1. If Phase 1 is done later, its objective is respecified:
-  **distil from the target**, do not pretrain on a general corpus (step 2).
+  all it buys — and the **n-gram proposer built instead of it already delivers
+  a measured speedup** (~1.7x on repetitive text). If Phase 1 is done later its
+  objective is respecified: **distil from the target**, do not pretrain on a
+  general corpus (RESUME HERE step 2).
+- **N-gram / prompt-lookup proposer: built, measured and gated (2026-08-04).**
+  A second proposer that needs no model at all. Break-even drops from ~60% to
+  ~30% acceptance, and on prompts whose answer copies the question it reaches
+  **~1.7x end to end**. On open-ended text it is a ~10% loss, which is the
+  honest caveat and is why a round is skipped outright when nothing matches.
+  See the N-gram Proposer section.
 - **Phase 3: complete and validated on GPU (2026-08-03).** The environment is
   built, the engine runs, and the exit criterion passes byte-identically. See
   Phase 3 Validation.
@@ -49,9 +53,10 @@ This file is a concise handoff log for LLM agents. It tracks progress against [s
   slower per step than a CUDA-graph decode, making break-even unreachable at
   *any* acceptance rate — the cause was kernel-launch overhead, not draft
   quality. Graphs now cover the verify and propose passes: a K=4 round went
-  134.9 ms -> **19.9 ms**, and break-even from impossible to **~60%** (~50% at K=2). **Phase 1 is now the binding constraint and is next**, with one change
-  to its spec — distil the draft from the target rather than training it on a
-  general corpus. See the two sections on break-even, and RESUME HERE.
+  134.9 ms -> **19.9 ms**, and break-even from impossible to **~60%** (~50% at
+  K=2). Acceptance rate then became the binding constraint — and the n-gram
+  proposer, not Phase 1, is what cleared it. See the two sections on break-even,
+  the N-gram Proposer section, and RESUME HERE.
 
 ## Phase 2 Results (2026-08-03, CPU, Qwen3-0.6B float32)
 
@@ -409,10 +414,13 @@ near-tie reorderings at K=8 and 0 at K=4, none of which changed the output.
 ## Phase 6 Results (2026-08-04)
 
 ```
-pytest tests/ -m "not gpu"   # 8 passed   — no CUDA, no checkpoints, ~15 s
-pytest tests/                # 14 passed  — adds the one-round GPU tests, ~40 s
-pytest tests/ --slow         # 17 passed  — adds the engine comparison, ~85 s
+pytest tests/ -m "not gpu"   # 30 passed  — no CUDA, no checkpoints, ~12 s
+pytest tests/                # 38 passed  — adds the one-round GPU tests, ~32 s
+pytest tests/ --slow         # 43 passed  — adds the engine comparisons, ~86 s
 ```
+
+(Counts as of the n-gram proposer landing; the "not gpu" tier grew most, since
+the lookup itself is exhaustively testable in pure Python.)
 
 ### The suite
 
@@ -424,6 +432,7 @@ signal and CI can pick a level:
 | maths | `test_spec_decode_correctness.py` | nothing | the sampler's output distribution equals the target's; `len(tokens) == num_accepted + 1`; the accepted prefix is never rewritten; greedy's degenerate behaviour |
 | one round | same file, `gpu` marker | CUDA + target | `verify()` at K=0 matches decode **bitwise**; a round emits exactly `truth[:M+1]` for M swept 0..K at 3 anchors |
 | engine | `test_spec_decode_end_to_end.py`, `slow` | CUDA + both models | greedy output identical with speculation on and off, at 0% and ~100% acceptance, with per-round invariants checked |
+| proposer | `test_ngram_proposer.py` | nothing | the n-gram lookup, exhaustively: longest match wins, most recent among equals, the quality floor, padding to K, and that the history is never mutated |
 
 `tests/spec_harness.py` holds the primitives. The dependency deliberately runs
 **tests → experiments**, not the reverse: `experiments/verify_pass_gate.py` and
@@ -464,6 +473,106 @@ because it happens to prepend the working directory. Both are now verified, from
 inside the repo and from outside it. It also registers the markers and the
 `--slow` option, and sets `TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0` before
 torch is imported.
+
+## N-gram Proposer (2026-08-04) — built, measured, gated
+
+**The alternative to Phase 1, and it landed.** `speculative_method="ngram"`
+replaces the draft *model* with a search over the request's own token history:
+match the last few committed tokens against earlier text, propose whatever
+followed them that time. No parameters, no second forward pass, no second KV
+cache. It is a production technique — vLLM ships it as `[ngram]`, HF
+transformers as `prompt_lookup_num_tokens`.
+
+### Why it needed no changes to the verify-and-accept core
+
+A lookup is a *deterministic* proposer, so its proposal distribution `q` is
+one-hot on the token proposed — exactly what `Sampler.greedy_probs` returns for
+a greedy draft model. `Executor.verify`, `Sampler.rejection_sample`, the
+scheduler's multi-token commit, `Scheduler.decode_extra_tokens` and the whole
+Phase 6 argument are untouched and carry over verbatim. **A proposer changes the
+acceptance rate; it can never change a token.**
+
+### What it costs, and what that does to break-even
+
+`experiments/spec_breakeven.py --method ngram`, batch 1, context 256, graphs on:
+
+| proposer | propose | round (K=4) | round/T_decode | break-even acceptance |
+|---|---|---|---|---|
+| draft model | 7.3 ms | 19.9 ms | 2.24 | ~60% |
+| **n-gram** | **0.25 ms** | **12.6 ms** | **1.41** | **~30%** |
+
+Flat in K, as the draft path is not: 11.8 ms at K=1, 12.8 ms at K=8. The round
+is now almost entirely one `verify()` pass (~9.7 ms of 12.6), which is itself
+within ~10% of a plain decode step because launch overhead dominates both.
+
+It also hands back the draft's memory: **237 KV-cache blocks against 185** at
+the local 4 GB profile.
+
+### End-to-end, on two workloads — and both belong in the write-up
+
+`--end-to-end ngram_graph --workload {open,repetitive}`, K=4, 128 tokens,
+2 requests, medians of paired runs against a graphed non-speculative baseline:
+
+| workload | baseline | n-gram | speedup | acceptance | rounds run |
+|---|---|---|---|---|---|
+| repetitive (answer copies the question) | 138 tok/s | **234 tok/s** | **~1.7x** | 79% | 44% of steps |
+| open-ended (chat) | 209 tok/s | 192 tok/s | ~0.9x | 18% | 4% of steps |
+
+Run-to-run spread on this laptop is several percent; do not quote these to a
+decimal. **The second row is not a footnote.** N-gram lookup wins on repetitive
+workloads — summarisation, code editing, RAG, "rewrite this paragraph" — and
+does nothing on open-ended generation, where the tail has simply never occurred
+before. Reporting only the first row would be dishonest, and reporting both is
+what makes this a result rather than a demo.
+
+### The skip path is what bounds the downside
+
+When no request in a batch has a match, `propose_ngram` returns `(None, None)`
+and `execute_speculative` falls back to `executor.execute(batch)` — a plain
+decode step. Without it, every open-ended step would pay 1.41x for a token it
+could have had for 1.0x, and the second row above would read ~0.7x instead of
+~0.9x. `Metrics.speculation_rate` reports how often a round actually ran, and it
+should always be read next to `acceptance_rate`: a high acceptance rate over 4%
+of steps is a different claim from the same rate over all of them.
+
+### `ngram_min_match_len` is a quality floor, and its default is measured
+
+A 1-token match exists nearly everywhere in text — every repeated comma is one —
+so a low floor makes the proposer speculate on essentially every step regardless
+of evidence, and a round costs ~1.4x a decode step. Measured across both
+workloads, **3 beat 2 on both**: it roughly halves how often the proposer fires
+while *raising* acceptance, because the rounds it drops are the losing ones.
+Default is 3. Raising it further keeps shrinking the open-ended loss toward
+zero (min=5 gives 194 tok/s at 0.7% speculation) at the cost of the repetitive
+win, so it is a real dial and Phase 7 should sweep it.
+
+### Gates
+
+- `pytest tests/test_ngram_proposer.py` — 22 exhaustive unit tests of the
+  lookup itself. Pure Python, no GPU, no checkpoints, runs in 0.1 s.
+  Mutation-checked against five ways of getting it wrong (earliest-match-wins,
+  shortest-pattern-first, no padding, self-match allowed, floor ignored); all
+  five caught.
+- `pytest tests/test_spec_decode_correctness.py -k ngram` — `q` really is
+  one-hot and matches the proposals; a no-match batch declines.
+- `pytest tests/test_spec_decode_end_to_end.py --slow -k ngram` — byte-identical
+  greedy output on *both* workloads, plus assertions that the proposer actually
+  fired and actually landed. The open-ended case is not redundant: it is
+  dominated by the skip path, which is a second route through
+  `execute_speculative` that the round-shaped assertions would not otherwise
+  cover.
+- Full suite: `pytest tests/ --slow` -> **43 passed**. `spec_round_gate`,
+  `verify_pass_gate` and `engine_spec_gate --compare --cuda-graph` all still
+  PASS.
+
+### One interface change
+
+`Executor.execute_speculative` returns `(tokens, num_accepted, num_proposed)`
+rather than a pair. `num_proposed` is 0 for a skipped step, and it is returned
+rather than recomputed by the caller so the acceptance rate stays honest —
+folding a phantom K proposals into the denominator would understate the proposer
+exactly when it is being correctly conservative. `Engine.step` and both
+`RoundRecorder`s were updated.
 
 ## CUDA graphs for the speculative path (2026-08-04) — FIXED
 
@@ -864,13 +973,15 @@ design or the algorithm either.
 # RESUME HERE
 
 The environment is built and Phases 0, 2, 3, 4, 5 and 6 are done. Speculative
-decoding **works end to end and is guarded by a committed test suite**. What
-remains is Phase 1 (train the draft) and Phase 7 (benchmark).
+decoding **works end to end, is guarded by a committed test suite, and is
+measurably faster** on repetitive workloads through the n-gram proposer. What
+remains is **Phase 7 (benchmark and write up)**, and optionally Phase 1 (train a
+draft) if the open-ended case is worth attacking.
 
 ### Step 0 — confirm the stack still works (10 minutes)
 
 ```
-pytest tests/ --slow                                            # 17 passed
+pytest tests/ --slow                                            # 43 passed
 python experiments/engine_spec_gate.py --compare --cuda-graph   # GATE: PASS - byte-identical
 ```
 
@@ -885,75 +996,21 @@ run (it fails loudly if a backend rebuild dropped
 If the environment needs rebuilding, the recipe is in Environment State above;
 the load-bearing detail is **CUDA 12.6, MSVC toolset 14.44**.
 
-### Step 1 (RECOMMENDED) — an n-gram proposer, instead of training a draft
+### Step 1 — DONE: the n-gram proposer
 
-**This is the cheaper path to a real measured speedup, and it is probably the
-better deliverable.** Half a day, no training, no data, no GPU time. Phase 1
-(step 2 below) becomes optional rather than load-bearing.
+**Built, measured and gated on 2026-08-04.** Full results in the N-gram Proposer
+section above; the short version is `speculative_method="ngram"`, break-even
+~30% instead of ~60%, **~1.7x end to end on repetitive text and ~0.9x on
+open-ended text**. Phase 1 is optional as a result rather than load-bearing.
 
-Replace the draft *model* with **prompt-lookup decoding**: match the last 2-3
-committed tokens against earlier text in `req.tokens`, and propose whatever
-followed that match last time. No parameters. It is a real production technique
-— vLLM ships it as the `[ngram]` speculative method, HF transformers as
-`prompt_lookup_num_tokens`.
+Nothing to do here unless the open-ended case is worth attacking, which is what
+step 2 is for. Two things to know before touching it:
 
-#### Why it fits this codebase almost for free
-
-`Executor.propose()` is the only thing that changes. It must return
-`(proposals, q)` where `q` is `(B, K, vocab)`; a lookup is a *deterministic*
-proposer, so `q` is one-hot on the proposed token — exactly the shape a greedy
-draft already returns. Which means **`verify()`, `Sampler.rejection_sample()`,
-the scheduler's multi-token commit, `Metrics`, and the whole test suite are
-untouched**, and the correctness argument already proved in Phases 5-6 carries
-over verbatim.
-
-#### Why it clears the bar far more easily
-
-`propose()` stops costing anything, and `propose()` is most of a round:
-
-| proposer | propose | round (K=4) | round/T_decode | acceptance needed |
-|---|---|---|---|---|
-| draft model | 7.3 ms | 19.9 ms | 2.24 | ~60% |
-| **n-gram** | ~0 ms | **~12.3 ms** | **~1.4** | **~30%** |
-
-On workloads with input/output overlap — summarisation, code editing, RAG,
-"rewrite this paragraph" — lookup acceptance routinely beats 30% by a wide
-margin. It also frees ~50 KV-cache blocks, since the draft model and its cache
-disappear (185 -> ~237 blocks at the local profile).
-
-#### Implementation sketch
-
-1. `Config` gains `speculative_method: "draft" | "ngram"` (and
-   `ngram_max_match_len`, say 3). `draft_model` becomes required only for
-   `"draft"`; `Executor` skips loading the draft, its KV cache and its
-   `CudaGraphRunner` under `"ngram"`. The target's runner is still sized at
-   `max_num_batched_seqs * (K+1)` — the verify pass is unchanged.
-2. `Executor.propose_ngram(requests)`: for each request, take the last `n`
-   tokens as a pattern, scan backwards through `req.tokens` for the most recent
-   earlier occurrence, and return the `K` tokens that followed it. Try `n`
-   descending from `ngram_max_match_len` to 1.
-3. **Every proposal list must be exactly K long** — `verify()` asserts uniform
-   length, since it returns a dense `(B, K+1, vocab)` tensor. On a miss, pad
-   with anything; the padding is rejected at i=0 and the round still emits one
-   token, which is the invariant that guarantees forward progress.
-4. **Skip the round entirely when no request has a match.** A no-match round
-   costs ~12.3 ms to produce the one token a plain decode step gets for 8.7 ms —
-   a ~40% loss. `Engine.step` should fall back to `executor.execute(batch)` when
-   the lookup comes up empty for every request. This is what keeps n-gram from
-   being a pessimisation on non-repetitive text.
-
-#### The honest caveat, which belongs in the README too
-
-**n-gram wins on repetitive workloads and does nothing on open-ended
-generation.** It is not a general-purpose accelerator and should not be written
-up as one. Measure both cases — one prompt set with high input/output overlap,
-one open-ended — and report both. Phase 7's chart then has something worth
-looking at: throughput vs K for two proposers across two workloads, with the
-break-even line drawn on it.
-
-That framing is also what makes this a *better* deliverable than the trained
-draft rather than a shortcut around it: two proposal strategies behind one
-verify-and-accept core, with measurements showing where each pays.
+- **`ngram_min_match_len` is the dial**, and Phase 7 should sweep it. Higher
+  means fewer rounds on better evidence; it shrinks the open-ended loss and the
+  repetitive win together.
+- **The skip path is load-bearing**, not an optimisation. Removing it turns the
+  open-ended ~0.9x into ~0.7x.
 
 ### Step 2 (OPTIONAL) — Phase 1: train the draft, by DISTILLATION not plain pretraining
 
@@ -1054,16 +1111,22 @@ Also re-run the correctness suite with the new draft — `pytest tests/ --slow`
 — since a *good* draft exercises partial-acceptance paths that neither the
 random draft (0%) nor the self-draft (~100%) reaches.
 
-### Step 3 — then Phase 7
+### Step 3 (NEXT) — Phase 7
 
-Phase 7 then has something to chart. Its chart should include the **break-even
-line**, not just throughput versus K — the interesting result on this hardware
-is *why* speculation does or does not pay, and that turned out to be a story
-about launch overhead before it was ever a story about draft quality.
+Phase 7 already has something to chart, without step 2. Its chart should include
+the **break-even line**, not just throughput versus K — the interesting result on
+this hardware is *why* speculation does or does not pay, and that turned out to
+be a story about launch overhead before it was ever a story about draft quality.
 
-If step 1 landed, chart **two proposers across two workloads** (one with high
-input/output overlap, one open-ended). That is the figure that explains
-something rather than just reporting a number.
+Chart **two proposers across two workloads** (repetitive and open-ended); step 1
+landed, so both axes have real data behind them, and
+`experiments/spec_breakeven.py` already produces every number the figure needs:
+`--method {draft,ngram}` for the microbenchmark table, `--end-to-end
+{base,spec,ngram}_graph --workload {open,repetitive}` for throughput.
+`tests/spec_harness.py` holds both prompt sets so the figure and the regression
+suite measure the same thing. Sweep `--ngram-min-match` too: it is the
+coverage/acceptance dial and the shape of that curve is the most interesting
+thing the n-gram proposer has to say.
 
 Calibrate expectations: a 0.6B target on a laptop GPU is close to the least
 favourable case for this technique, whose reputation comes from 7B+ models where
@@ -1089,13 +1152,17 @@ Two things to respect, both measured:
 
 - Phase 0: **complete — go decision recorded.** Note its identified verify path
   was wrong; corrected in Phase 4. Committed as `8f16197` on branch `test`.
-- Phase 1: **optional, and no longer the recommended next step.** Acceptance
-  rate is the only thing between this feature and a speedup, but an **n-gram
-  proposer reaches that bar for half a day of work instead of a week** — it
-  needs ~30% acceptance rather than ~60%, because removing the draft model
-  removes most of the round's cost. RESUME HERE step 1. Phase 1 remains worth
-  doing for the open-ended-generation case that lookup cannot help; if so,
-  distil from Qwen3-0.6B rather than pretraining on a general corpus (step 2).
+- Phase 1: **optional, and superseded as the route to a speedup.** Acceptance
+  rate was the only thing between this feature and a speedup, and the **n-gram
+  proposer cleared that bar in half a day instead of a week** — it needs ~30%
+  acceptance rather than ~60%, and measures ~1.7x on repetitive text. Phase 1
+  remains worth doing for the open-ended case that lookup cannot help (where
+  n-gram is a ~10% *loss*); if so, distil from Qwen3-0.6B rather than
+  pretraining on a general corpus. RESUME HERE step 2.
+- **N-gram proposer: complete, measured and gated (not a numbered phase).**
+  `speculative_method="ngram"`, `minivllm/executor/ngram.py`,
+  `tests/test_ngram_proposer.py`. Break-even ~30%; ~1.7x on repetitive prompts,
+  ~0.9x on open-ended. See the N-gram Proposer section.
 - Phase 2: **complete — both gates passing**, 18/18 exact match. See results above.
 - Phase 3: **complete and validated on GPU.** Config fields,
   `load_draft_model`, dual KV-cache allocation, draft checkpoint. Exit
@@ -1116,17 +1183,18 @@ Two things to respect, both measured:
   criterion survives as written but as a **tolerance**: byte-identical greedy
   output holds everywhere measured, though a near-tie flip is possible and is
   not a bug. See Phase 6 Results.
-- Phase 7: needs a proposer that actually lands — either the n-gram lookup
-  (RESUME HERE step 1) or a trained draft (Phase 1). No longer blocked on the
-  decode race: the verify pass is clean at K=4, 8 and 16, so the sweep can vary
-  K freely. Chart the **break-even line** alongside throughput, and if the
-  n-gram proposer landed, chart two proposers across two workloads.
+- Phase 7: **next, and unblocked.** It needed a proposer that actually lands and
+  the n-gram lookup is one, so a trained draft is no longer a prerequisite. Not
+  blocked on the decode race either: the verify pass is clean at K=4, 8 and 16,
+  so the sweep can vary K freely. Chart the **break-even line** alongside
+  throughput, two proposers across two workloads, and sweep
+  `ngram_min_match_len`. RESUME HERE step 3.
 
 ## Handoff Notes for Agents
 
-- **Start at "RESUME HERE" above.** The environment is built and speculative
-  decoding runs end to end through Phase 6; next work is the n-gram proposer
-  (step 1), which is what stands between this and a measured speedup.
+- **Start at "RESUME HERE" above.** The environment is built, speculative
+  decoding runs end to end through Phase 6, and the n-gram proposer gives it a
+  measured speedup on repetitive workloads. Next work is Phase 7 (step 3).
 - Read [speculative-decoding-plan.md](speculative-decoding-plan.md) first.
 - [experiments/engine_spec_gate.py](experiments/engine_spec_gate.py) is the
   engine-level correctness gate and the fastest way to confirm the stack is

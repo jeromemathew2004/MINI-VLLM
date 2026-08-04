@@ -38,9 +38,9 @@ python benchmark/run_vllm.py   # compares against real vLLM
 
 # Tests. The root conftest.py registers markers and puts the repo root on
 # sys.path, so any invocation and any working directory work.
-pytest tests/                  # maths + one-round GPU tests (~40 s)
-pytest tests/ -m "not gpu"     # no CUDA and no checkpoints needed (~15 s)
-pytest tests/ --slow           # adds the end-to-end engine comparison (~75 s)
+pytest tests/                  # maths + proposer + one-round GPU tests (~32 s)
+pytest tests/ -m "not gpu"     # no CUDA and no checkpoints needed (~12 s)
+pytest tests/ --slow           # adds the end-to-end engine comparisons (~86 s)
 pytest tests/test_block_manager.py -v
 ```
 
@@ -48,8 +48,9 @@ Markers: `gpu` needs a CUDA device and `~/huggingface/Qwen3-0.6B/`, and skips
 cleanly without them; `slow` builds engines and generates text, and is skipped
 unless `--slow` is passed. `tests/spec_harness.py` holds the primitives for
 driving the executor by hand (prefill one request, take N plain decode steps,
-run one scripted round) — `experiments/verify_pass_gate.py` and
-`experiments/spec_round_gate.py` import from it, so the dependency runs
+run one scripted round) plus the two prompt sets the n-gram measurements use —
+`experiments/verify_pass_gate.py`, `experiments/spec_round_gate.py` and
+`experiments/spec_breakeven.py` import from it, so the dependency runs
 tests → experiments and never the other way.
 
 There is no lint/format tooling configured in this repo.
@@ -58,7 +59,7 @@ There is no lint/format tooling configured in this repo.
 
 Request flow: `Engine.step()` drives one iteration — `Scheduler.schedule()` picks a `Batch`, `Executor.execute()` runs it on the GPU and samples tokens, `Scheduler.update()` appends the tokens to requests and frees/advances KV-cache blocks. `update()` takes a *list* of tokens per request and returns how many it committed, because a speculative round emits between 1 and K+1; the non-speculative path passes single-element lists.
 
-- **`minivllm/config/config.py`** — `Config` dataclass holds model path, HF config, scheduler limits (`max_num_batched_tokens`, `max_num_batched_seqs`), and KV-cache sizing (`kv_cache_num_blocks`, `kv_cache_block_size`, `gpu_memory_utilization`). `kv_cache_num_blocks` gets overwritten at runtime by `Executor._init_kv_cache` based on actual free GPU memory.
+- **`minivllm/config/config.py`** — `Config` dataclass holds model path, HF config, scheduler limits (`max_num_batched_tokens`, `max_num_batched_seqs`), KV-cache sizing (`kv_cache_num_blocks`, `kv_cache_block_size`, `gpu_memory_utilization`), and the speculative-decoding knobs (`use_speculative_decoding`, `speculative_method`, `draft_model`, `num_speculative_tokens`, `ngram_{min,max}_match_len`). `kv_cache_num_blocks` gets overwritten at runtime by `Executor._init_kv_cache` based on actual free GPU memory.
 - **`minivllm/engine/engine.py`** — top-level `Engine` class; owns tokenizer, `Executor`, `Scheduler`, `Metrics`. `generate()` is the blocking batch-generation API used by `run.py`/benchmarks; `submit()` + `step()` is the incremental API used by `chat.py` for streaming.
 - **`minivllm/engine/request.py`** — `Request` tracks prompt + generated tokens, KV-cache block ids (`req.blocks`), and lifecycle state (`WAITING` → `RUNNING` → `FINISHED`).
 - **`minivllm/scheduler/scheduler.py`** — continuous-batching scheduler. Always prefers scheduling a prefill batch over a decode batch (`schedule()` tries `_schedule_prefill` first). Handles preemption: if KV-cache blocks run out during decode scheduling, it evicts the most-recently-added running request back to `waiting` and frees its blocks (`preempt`).
@@ -69,17 +70,25 @@ Request flow: `Engine.step()` drives one iteration — `Scheduler.schedule()` pi
   - Runs a `_warmup_model()` prefill pass at startup to size the KV cache correctly before real allocation.
 - **`minivllm/executor/context.py`** — `Context` dataclass carries all per-forward-pass tensors (positions, slot_mapping, cu_seqlens, block_table, cache_seqlens) threaded through every model/attention call; distinguishes prefill vs decode via `ctx.prefill`.
 - **`minivllm/executor/graph.py`** — `CudaGraphRunner` pre-captures CUDA graphs for a fixed set of decode batch sizes (`[1, 2, 4, 8, 16, 32, ...]` up to `max_batch_size` capped at 256) to cut decode-step launch overhead; only used for decode, never prefill.
+- **`minivllm/executor/ngram.py`** — `lookup(tokens, K, max_match_len, min_match_len)`, the prompt-lookup proposer. Pure Python over a token list, no torch, no state: returns exactly K token ids or `None`. Longest match first, most recent among equal lengths, padded to K when the match ran off the end of the history.
 - **`minivllm/models/`** — `loader.py` maps HF `architectures[0]` to a model class via `models/models/__init__.py`'s `_MODELS` registry, then loads safetensors weights with a custom `weight_loader` mechanism for packed QKV projections (see `Qwen3ForCausalLM.load_weights`). Model `forward()` signatures are uniformly `(ctx: Context, input_ids, positions) -> logits`, and at prefill time only the last hidden state per sequence is projected to logits (`ctx.cu_seqlens_q[1:] - 1`).
 - **`minivllm/models/layers/attention.py`** — `FlashAttention` wraps `mini_flash_attention`'s `flash_attn_varlen_func` (prefill) and `flash_attn_with_kvcache` (decode), and writes new K/V into the paged cache via a Triton kernel (`store_kvcache_kernel`) before attention runs.
-- **`minivllm/engine/metrics.py`** — tracks prefill/decode throughput, TTFT, inter-token latency, plus `acceptance_rate` and `tokens_per_request_step` for speculative decoding; surfaced live in `Engine.generate`'s tqdm postfix. Decode tokens are counted from the scheduler's committed counts, not from the batch width.
+- **`minivllm/engine/metrics.py`** — tracks prefill/decode throughput, TTFT, inter-token latency, plus `acceptance_rate`, `tokens_per_request_step` and `speculation_rate` for speculative decoding; surfaced live in `Engine.generate`'s tqdm postfix. Decode tokens are counted from the scheduler's committed counts, not from the batch width.
 
 ### Speculative decoding (implemented and working end to end)
 
 `speculative-decoding-plan.md` and `PROGRESS.md` track the speculative decoding effort. **`PROGRESS.md` is the source of truth for phase status — read it first, and start from its "RESUME HERE" runbook.**
 
-Status as of 2026-08-04: **Phases 0, 2, 3, 4 and 5 complete and verified on GPU. The engine decodes speculatively end to end; Phase 6 (committing the harness as a pytest regression test) is next.** `docs/spec_decoding_feasibility.md` is the authoritative note.
+Status as of 2026-08-04: **Phases 0, 2, 3, 4, 5 and 6 complete and verified on GPU, plus an n-gram proposer that is not a numbered phase. The engine decodes speculatively end to end and is measurably faster on repetitive workloads; Phase 7 (benchmark and write-up) is next. Phase 1 (train a draft) is optional.** `docs/spec_decoding_feasibility.md` is the authoritative note.
 
-The round lives in `Engine.step`: when `use_speculative_decoding` is set and the batch is a DECODE batch, it calls `Executor.execute_speculative` instead of `execute`. That runs `propose()` (K sequential draft steps) → `verify()` (one target pass over K+1 query rows per request) → `Sampler.rejection_sample`, and returns between 1 and K+1 tokens per request for `Scheduler.update` to commit. Prefill is never speculative — the draft prefills alongside the target inside `Executor.execute`, over the same `Context`, because the two caches share block ids.
+The round lives in `Engine.step`: when `use_speculative_decoding` is set and the batch is a DECODE batch, it calls `Executor.execute_speculative` instead of `execute`. That runs a proposer → `verify()` (one target pass over K+1 query rows per request) → `Sampler.rejection_sample`, and returns `(tokens, num_accepted, num_proposed)` where each request gets between 1 and K+1 tokens for `Scheduler.update` to commit. Prefill is never speculative — with a draft model, the draft prefills alongside the target inside `Executor.execute`, over the same `Context`, because the two caches share block ids.
+
+**Two proposers**, selected by `Config.speculative_method`:
+
+- `"draft"` — `Executor.propose()` runs a small model K times. Needs `draft_model`, a second KV cache and a second `CudaGraphRunner`.
+- `"ngram"` — `Executor.propose_ngram()` matches the last few committed tokens against the request's own history (`minivllm/executor/ngram.py`) and proposes what followed them before. No model, no cache, no GPU time. **This is the one that produces a measured speedup**; see below.
+
+Both feed the same verify-and-accept core untouched, because a greedy draft and a deterministic lookup both produce a **one-hot `q`**. That is the whole reason the second proposer needed no changes to `verify()`, `rejection_sample()`, the scheduler or the test suite. A proposer changes the acceptance rate; it can never change a token.
 
 Gate: `python experiments/spec_round_gate.py` (add `--k 8`). Greedy output is byte-identical with speculation on and off at K=4 and K=8, at 0% acceptance (random draft) and ~100% (target drafting for itself).
 
@@ -95,14 +104,22 @@ Phase 4 added `Executor.verify(requests, proposals) -> (num_requests, K+1, vocab
 
 Phase 5 added `Sampler.rejection_sample` + `Sampler.greedy_probs` (`Sampler.forward`, the plain-decode path, is untouched), `Executor.propose` / `execute_speculative` / `_build_paged_rows`, a multi-token `Scheduler.update` that returns committed counts, `Scheduler.decode_extra_tokens` so the preemption check reserves the proposal region, and acceptance-rate metrics.
 
+Phase 6 committed the correctness harness as `tests/test_spec_decode_correctness.py` + `tests/test_spec_decode_end_to_end.py` + `tests/spec_harness.py` + a root `conftest.py`, mutation-checked. `pytest tests/ --slow` is 43 passed.
+
+The n-gram proposer added `Config.speculative_method` / `ngram_max_match_len` / `ngram_min_match_len`, `minivllm/executor/ngram.py`, `Executor.propose_ngram` / `_propose`, `Metrics.speculation_rate`, and 22 pure-Python unit tests in `tests/test_ngram_proposer.py`. `execute_speculative` grew a third return value, `num_proposed`, which is 0 when the round was skipped.
+
 Things to know before working on this:
 
 - **The speculative path is greedy-only, by design.** `execute_speculative` asserts `top_k <= 0 and top_p >= 1.0`. Rejection sampling has to compare the exact distribution the non-speculative path would have sampled from, and for top-k/top-p that lives inside flashinfer's fused kernel and is never exposed. Temperature needs no handling: with top-k/top-p unset, `Sampler.forward` argmaxes whatever the temperature.
 - **Speculative decoding is asserted incompatible with prefix caching** (off by default). A multi-token commit can step over the block boundary `cache_block_if_needed` hashes on.
 - **CUDA graphs cover the speculative path too.** A verify pass is decode-shaped — one query row per *batch entry*, not per request — so it replays the target's graphs at width `num_requests * (K+1)`; the draft gets its own `CudaGraphRunner` at `2 * max_num_batched_seqs`. `Executor._decode_forward` replays when a captured size fits and falls back to eager otherwise, so graph sizing is a performance question, not a correctness one. This is load-bearing: measured, graphs are worth ~8x per step here, and without them a round costs 15x a graphed decode step and break-even is unreachable at *any* acceptance rate.
-- **Break-even is ~50% acceptance at K=2 and ~60% at K=4** (`experiments/spec_breakeven.py`), with ceilings of ~1.7x / ~2.2x; run-to-run variance is a few points, so do not quote these to a decimal. `verify()` is flat in K (~10 ms); `propose()` costs ~1.8 ms per draft step, so K is a tradeoff between spreading the fixed cost and paying for drafting. Aim Phase 1 at K=2-4.
+- **Break-even with a draft model is ~50% acceptance at K=2 and ~60% at K=4** (`experiments/spec_breakeven.py`), with ceilings of ~1.7x / ~2.2x; run-to-run variance is a few points, so do not quote these to a decimal. `verify()` is flat in K (~10 ms); `propose()` costs ~1.8 ms per draft step, so K is a tradeoff between spreading the fixed cost and paying for drafting. Aim Phase 1 at K=2-4.
+- **With the n-gram proposer, break-even is ~30%**, because `propose()` drops from 7.3 ms to 0.25 ms and a K=4 round from 19.9 ms to 12.6 ms. It also hands back the draft's memory: 237 KV blocks instead of 185.
+- **N-gram results are workload-dependent and both halves must be reported.** Measured end to end at K=4: **~1.7x on prompts whose answer copies the question** (138 → 234 tok/s, 79% acceptance) and **~0.9x on open-ended chat** (209 → 192 tok/s, 18% acceptance). It is not a general-purpose accelerator. `experiments/spec_breakeven.py --end-to-end ngram_graph --workload {open,repetitive}` reproduces both; `tests/spec_harness.py` holds both prompt sets.
+- **The skip path is load-bearing, not an optimisation.** When no request in a batch has a lookup match, `propose_ngram` returns `(None, None)` and `execute_speculative` falls back to `executor.execute(batch)`. Without it, open-ended text would pay ~1.4x per step for a token plain decode gets at 1.0x, and the ~0.9x above would be ~0.7x. `Metrics.speculation_rate` reports how often a round actually ran and should always be read next to `acceptance_rate`.
+- **`ngram_min_match_len` defaults to 3 because a low floor is a trap.** A 1-token match exists nearly everywhere in text, so a floor of 1 makes the proposer speculate on essentially every step regardless of evidence. Measured, 3 beat 2 on both workloads — it roughly halves how often the proposer fires while raising acceptance, since the rounds it drops are the losing ones.
 - **K is not capped.** It briefly was, at 4, by the decode-kernel race (a verify pass runs at batch width `num_requests * (K+1)`). That race is fixed; gates pass at K=4, 8 and 16. If a high-K run starts reporting hard mismatches, check `experiments/decode_determinism_check.py` before suspecting anything here — it means the backend patch is missing.
 - **Byte-identical greedy output is a tolerance, not a guarantee.** It holds in every configuration measured, contradicting the Phase 4 prediction that it could not. But batch shape moves logits by up to 0.5 absolute (cuBLAS retiling, unrelated to the fixed race), so a near-tie can flip an emitted token without anything being wrong. Keep the near-tie classification the gates use rather than asserting bitwise equality blindly.
-- **Phase 1 (draft model training) is deliberately deferred** until correctness is locked. Rejection sampling is exactly distribution-preserving regardless of draft quality, so a random-init tiny draft drives the correctness harness; a trained draft only affects acceptance rate and speedup. Phase 7's speedup numbers need it.
+- **Phase 1 (draft model training) is optional, not deferred-and-blocking.** Rejection sampling is exactly distribution-preserving regardless of draft quality, so a random-init tiny draft drives the correctness harness; a trained draft only affects acceptance rate. Phase 7 no longer needs it — the n-gram proposer supplies the speedup — but a trained draft is the only route to helping the open-ended case, where lookup cannot. If it is done, **distil from the target** rather than pretraining on a general corpus (`PROGRESS.md` → RESUME HERE step 2).
 
 Do not modify paging core code, and keep scheduler changes to the decode path — speculative decoding is a decode-path feature. Check `PROGRESS.md` for the latest phase status first.
