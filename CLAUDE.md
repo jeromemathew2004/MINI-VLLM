@@ -45,7 +45,7 @@ There is no lint/format tooling configured in this repo.
 
 ## Architecture
 
-Request flow: `Engine.step()` drives one iteration — `Scheduler.schedule()` picks a `Batch`, `Executor.execute()` runs it on the GPU and samples tokens, `Scheduler.update()` appends the tokens to requests and frees/advances KV-cache blocks.
+Request flow: `Engine.step()` drives one iteration — `Scheduler.schedule()` picks a `Batch`, `Executor.execute()` runs it on the GPU and samples tokens, `Scheduler.update()` appends the tokens to requests and frees/advances KV-cache blocks. `update()` takes a *list* of tokens per request and returns how many it committed, because a speculative round emits between 1 and K+1; the non-speculative path passes single-element lists.
 
 - **`minivllm/config/config.py`** — `Config` dataclass holds model path, HF config, scheduler limits (`max_num_batched_tokens`, `max_num_batched_seqs`), and KV-cache sizing (`kv_cache_num_blocks`, `kv_cache_block_size`, `gpu_memory_utilization`). `kv_cache_num_blocks` gets overwritten at runtime by `Executor._init_kv_cache` based on actual free GPU memory.
 - **`minivllm/engine/engine.py`** — top-level `Engine` class; owns tokenizer, `Executor`, `Scheduler`, `Metrics`. `generate()` is the blocking batch-generation API used by `run.py`/benchmarks; `submit()` + `step()` is the incremental API used by `chat.py` for streaming.
@@ -60,13 +60,17 @@ Request flow: `Engine.step()` drives one iteration — `Scheduler.schedule()` pi
 - **`minivllm/executor/graph.py`** — `CudaGraphRunner` pre-captures CUDA graphs for a fixed set of decode batch sizes (`[1, 2, 4, 8, 16, 32, ...]` up to `max_batch_size` capped at 256) to cut decode-step launch overhead; only used for decode, never prefill.
 - **`minivllm/models/`** — `loader.py` maps HF `architectures[0]` to a model class via `models/models/__init__.py`'s `_MODELS` registry, then loads safetensors weights with a custom `weight_loader` mechanism for packed QKV projections (see `Qwen3ForCausalLM.load_weights`). Model `forward()` signatures are uniformly `(ctx: Context, input_ids, positions) -> logits`, and at prefill time only the last hidden state per sequence is projected to logits (`ctx.cu_seqlens_q[1:] - 1`).
 - **`minivllm/models/layers/attention.py`** — `FlashAttention` wraps `mini_flash_attention`'s `flash_attn_varlen_func` (prefill) and `flash_attn_with_kvcache` (decode), and writes new K/V into the paged cache via a Triton kernel (`store_kvcache_kernel`) before attention runs.
-- **`minivllm/engine/metrics.py`** — tracks prefill/decode throughput, TTFT, inter-token latency; surfaced live in `chat.py`'s progress bar and `Engine.generate`'s tqdm postfix.
+- **`minivllm/engine/metrics.py`** — tracks prefill/decode throughput, TTFT, inter-token latency, plus `acceptance_rate` and `tokens_per_request_step` for speculative decoding; surfaced live in `Engine.generate`'s tqdm postfix. Decode tokens are counted from the scheduler's committed counts, not from the batch width.
 
-### Speculative decoding effort (in progress, not yet implemented)
+### Speculative decoding (implemented and working end to end)
 
 `speculative-decoding-plan.md` and `PROGRESS.md` track the speculative decoding effort. **`PROGRESS.md` is the source of truth for phase status — read it first, and start from its "RESUME HERE" runbook.**
 
-Status as of 2026-08-03: **Phases 0, 2, 3 and 4 complete and verified on GPU. Phase 5 (rejection sampling in the engine) is next.** `docs/spec_decoding_feasibility.md` is the authoritative note.
+Status as of 2026-08-04: **Phases 0, 2, 3, 4 and 5 complete and verified on GPU. The engine decodes speculatively end to end; Phase 6 (committing the harness as a pytest regression test) is next.** `docs/spec_decoding_feasibility.md` is the authoritative note.
+
+The round lives in `Engine.step`: when `use_speculative_decoding` is set and the batch is a DECODE batch, it calls `Executor.execute_speculative` instead of `execute`. That runs `propose()` (K sequential draft steps) → `verify()` (one target pass over K+1 query rows per request) → `Sampler.rejection_sample`, and returns between 1 and K+1 tokens per request for `Scheduler.update` to commit. Prefill is never speculative — the draft prefills alongside the target inside `Executor.execute`, over the same `Context`, because the two caches share block ids.
+
+Gate: `python experiments/spec_round_gate.py` (add `--k 8`). Greedy output is byte-identical with speculation on and off at K=4 and K=8, at 0% acceptance (random draft) and ~100% (target drafting for itself).
 
 Phase 0's no-go was reversed, then its *mechanism* was corrected in Phase 4. Phase 0 concluded the verify pass is a chunked-prefill shape routed through `flash_attn_varlen_func` with a `block_table`. Measured on GPU, that does not work: **that kernel's causal mask is top-left anchored** (`csrc/mfa/prefill.cuh:416` masks `col > row` with no `seqlen_k - seqlen_q` shift), so a K+1-token query against a longer cache attends to keys 0..j instead of its own history. Phase 0 reasoned from the signature, which does not reveal this.
 
@@ -78,10 +82,15 @@ Phase 3 added `use_speculative_decoding` / `draft_model` / `num_speculative_toke
 
 Phase 4 added `Executor.verify(requests, proposals) -> (num_requests, K+1, vocab_size)` plus `_build_verify_input`, an optional `extra_tokens=` on the block manager's decode allocation (default 0, so existing behaviour is untouched), and the `Config` block-size assert. Stale KV from rejected proposals is left in place, not zeroed: reads are bounded by `cache_seqlens` and the next round overwrites from the first dead slot. Gated by `experiments/verify_pass_gate.py` — 162 rows across 7 anchors x 4 acceptance scripts x 2 prompts, 0 hard mismatches, and `verify()` row 0 is *bitwise* identical to a decode step at the same batch width.
 
+Phase 5 added `Sampler.rejection_sample` + `Sampler.greedy_probs` (`Sampler.forward`, the plain-decode path, is untouched), `Executor.propose` / `execute_speculative` / `_build_paged_rows`, a multi-token `Scheduler.update` that returns committed counts, `Scheduler.decode_extra_tokens` so the preemption check reserves the proposal region, and acceptance-rate metrics.
+
 Things to know before working on this:
 
-- **K is not capped.** It briefly was, at 4, by the decode-kernel race (a verify pass runs at batch width `num_requests * (K+1)`). That race is fixed; the gate passes at K=4, 8 and 16. If a high-K run starts reporting hard mismatches, check `experiments/decode_determinism_check.py` before suspecting the verify pass — it means the backend patch is missing.
-- **Phase 6's exit criterion needs restating.** It calls for byte-identical greedy output with speculation on and off; that is unachievable in bf16 once speculation changes batch shapes. Phase 3's gate passed only because the draft was loaded and never run. Use float32 or distributional equivalence with near-tie classification.
-- **Phase 1 (draft model training) is deliberately deferred** until correctness is locked. Rejection sampling is exactly distribution-preserving regardless of draft quality, so a random-init tiny draft drives the correctness harness; a trained draft only affects acceptance rate and speedup.
+- **The speculative path is greedy-only, by design.** `execute_speculative` asserts `top_k <= 0 and top_p >= 1.0`. Rejection sampling has to compare the exact distribution the non-speculative path would have sampled from, and for top-k/top-p that lives inside flashinfer's fused kernel and is never exposed. Temperature needs no handling: with top-k/top-p unset, `Sampler.forward` argmaxes whatever the temperature.
+- **Speculative decoding is asserted incompatible with prefix caching** (off by default). A multi-token commit can step over the block boundary `cache_block_if_needed` hashes on.
+- **CUDA graphs are skipped, not just unused, when speculation is on.** Graphs are captured for one query row per request and a round runs K+1.
+- **K is not capped.** It briefly was, at 4, by the decode-kernel race (a verify pass runs at batch width `num_requests * (K+1)`). That race is fixed; gates pass at K=4, 8 and 16. If a high-K run starts reporting hard mismatches, check `experiments/decode_determinism_check.py` before suspecting anything here — it means the backend patch is missing.
+- **Byte-identical greedy output is a tolerance, not a guarantee.** It holds in every configuration measured, contradicting the Phase 4 prediction that it could not. But batch shape moves logits by up to 0.5 absolute (cuBLAS retiling, unrelated to the fixed race), so a near-tie can flip an emitted token without anything being wrong. Keep the near-tie classification the gates use rather than asserting bitwise equality blindly.
+- **Phase 1 (draft model training) is deliberately deferred** until correctness is locked. Rejection sampling is exactly distribution-preserving regardless of draft quality, so a random-init tiny draft drives the correctness harness; a trained draft only affects acceptance rate and speedup. Phase 7's speedup numbers need it.
 
-Do not modify scheduler/paging core code — speculative decoding is a decode-path feature. Check `PROGRESS.md` for the latest phase status first.
+Do not modify paging core code, and keep scheduler changes to the decode path — speculative decoding is a decode-path feature. Check `PROGRESS.md` for the latest phase status first.

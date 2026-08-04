@@ -157,11 +157,17 @@ class KVCacheBlockManager:
         Cache the last block of the request if it is full
         """
         if len(req.tokens) % self.block_size == 0:
-            last_block = self.block_table[req.blocks[-1]]
+            # Index by the position of the last token rather than by req.blocks[-1].
+            # The two agree whenever the request holds exactly cdiv(len, block_size)
+            # blocks, which is every non-speculative case; a speculative round
+            # reserves K tokens of slack ahead of the committed ones, so the request
+            # can hold trailing blocks that no committed token lives in yet.
+            block_index = (len(req.tokens) - 1) // self.block_size
+            last_block = self.block_table[req.blocks[block_index]]
             assert last_block.hash == -1
             tokens = req.tokens[-self.block_size:]
-            if len(req.blocks) > 1:
-                prefix = self.block_table[req.blocks[-2]].hash
+            if block_index > 0:
+                prefix = self.block_table[req.blocks[block_index - 1]].hash
             else:
                 prefix = -1
             h = KVCacheBlock.compute_hash(tokens, prefix)

@@ -22,13 +22,28 @@ class Executor:
         self.draft_model = load_draft_model(config) if config.use_speculative_decoding else None
         self.draft_kv_cache = None
 
+        # RNG for rejection sampling. None means torch's default generator;
+        # tests set it to make a round reproducible. Under greedy sampling the
+        # round is deterministic regardless — p and q are one-hot, so every
+        # accept/reject test and every residual draw has a single outcome.
+        self.spec_generator: torch.Generator | None = None
+
         self.sampler = Sampler()
 
         self._warmup_model()
 
         self._init_kv_cache()
         
-        if config.use_cuda_graph:
+        self.graph_runner = None
+        if config.use_cuda_graph and config.use_speculative_decoding:
+            # Every graph is captured for one query row per request, and a
+            # speculative round runs K+1 of them, so none of them could ever be
+            # replayed. Capturing anyway would only reserve a graph pool that
+            # nothing draws from — which on a small card is memory the KV cache
+            # could have used. Plan section 7.4 calls for eager verify passes;
+            # this is that, taken to its conclusion.
+            logging.info("CUDA graphs skipped: speculative rounds run eagerly.")
+        elif config.use_cuda_graph:
             logging.info("Initializing CUDA graph executor...")
             self.graph_runner = CudaGraphRunner(self.model, self.config, self.config.max_num_batched_seqs)
             self.graph_runner.capture()
@@ -211,6 +226,58 @@ class Executor:
         return input_ids, ctx
 
 
+    def _build_paged_rows(self, requests: list[Request],
+                          rows: list[list[tuple[int, int]]]) -> tuple[torch.Tensor, Context]:
+        """Decode-shaped inputs from an explicit (token, position) list per request.
+
+        Every row is one query token: it is written into the paged cache at the
+        slot its absolute position maps to, and then attends to keys
+        `0..position` of its own request. `_build_decode_input` is the
+        one-row-per-request special case of this; a verify pass and the draft's
+        proposal steps pass more than one.
+
+        The extra rows of a request ride in the *batch* dimension rather than in
+        a query dimension — see `_build_verify_input` for why that is the only
+        multi-token shape mini-flash-attention can express.
+        """
+        block_size = self.config.kv_cache_block_size
+
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        cache_seqlens = []
+        block_table = []
+
+        max_block_len = max(len(req.blocks) for req in requests)
+
+        for req, req_rows in zip(requests, rows):
+            padded_blocks = req.blocks + [-1] * (max_block_len - len(req.blocks))
+
+            for token, pos in req_rows:
+                assert pos // block_size < len(req.blocks), (
+                    f"request {req.id} holds {len(req.blocks)} blocks, too few to reach "
+                    f"position {pos}. A speculative round writes KV for tokens that are "
+                    f"not in req.tokens yet, so the caller must reserve them first with "
+                    f"allocate_block_for_decode(req, extra_tokens=K)."
+                )
+                input_ids.append(token)
+                positions.append(pos)
+                # Each row attends to its own prefix, inclusive of itself.
+                cache_seqlens.append(pos + 1)
+                slot_mapping.append(req.blocks[pos // block_size] * block_size + pos % block_size)
+                block_table.append(padded_blocks)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        ctx = Context(
+            prefill=False,
+            positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            cache_seqlens = torch.tensor(cache_seqlens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            block_table = torch.tensor(block_table, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+        )
+        return input_ids, ctx
+
+
     def _build_verify_input(self, requests: list[Request],
                             proposals: list[list[int]]) -> tuple[torch.Tensor, Context]:
         """Inputs for a speculative verify pass: K+1 query tokens per request.
@@ -240,44 +307,12 @@ class Executor:
         `num_requests * (K+1)` tokens with one GEMM per projection; only the
         attention gather is per-row.
         """
-        block_size = self.config.kv_cache_block_size
-
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        cache_seqlens = []
-        block_table = []
-
-        max_block_len = max(len(req.blocks) for req in requests)
-
+        rows = []
         for req, proposal in zip(requests, proposals):
             base = len(req.tokens) - 1
-            padded_blocks = req.blocks + [-1] * (max_block_len - len(req.blocks))
-
-            for offset, token in enumerate([req.tokens[-1], *proposal]):
-                pos = base + offset
-                assert pos // block_size < len(req.blocks), (
-                    f"request {req.id} holds {len(req.blocks)} blocks, too few to reach "
-                    f"position {pos}. A verify pass writes KV for tokens that are not in "
-                    f"req.tokens yet, so the caller must reserve them first with "
-                    f"allocate_block_for_decode(req, extra_tokens={len(proposal)})."
-                )
-                input_ids.append(token)
-                positions.append(pos)
-                # Each row attends to its own prefix, inclusive of itself.
-                cache_seqlens.append(pos + 1)
-                slot_mapping.append(req.blocks[pos // block_size] * block_size + pos % block_size)
-                block_table.append(padded_blocks)
-
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        ctx = Context(
-            prefill=False,
-            positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
-            slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            cache_seqlens = torch.tensor(cache_seqlens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            block_table = torch.tensor(block_table, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-        )
-        return input_ids, ctx
+            rows.append([(token, base + offset)
+                         for offset, token in enumerate([req.tokens[-1], *proposal])])
+        return self._build_paged_rows(requests, rows)
 
     @torch.inference_mode()
     def verify(self, requests: list[Request], proposals: list[list[int]]) -> torch.Tensor:
@@ -318,6 +353,110 @@ class Executor:
         input_ids, ctx = self._build_verify_input(requests, proposals)
         logits = self.model(ctx, input_ids, ctx.positions)
         return logits.view(len(requests), num_proposals + 1, -1)
+
+    @torch.inference_mode()
+    def propose(self, requests: list[Request]) -> tuple[list[list[int]], torch.Tensor]:
+        """Run the draft model K times to propose K tokens per request.
+
+        Returns `(proposals, q)`, where `proposals[i]` is request i's K token
+        ids and `q` is the `(num_requests, K, vocab_size)` distributions they
+        were drawn from. Rejection sampling needs the distribution and not just
+        the token, since it compares `q(x)` against the target's `p(x)`.
+
+        The draft is run greedily, matching the target — `execute_speculative`
+        rejects any other sampling policy.
+
+        **Why the first step feeds two tokens.** The draft shares the target's
+        block ids (Phase 3) but keeps its own position frontier, and it ends a
+        round one token behind whenever every proposal was accepted: it runs K
+        steps covering positions `base .. base+K-1`, while a full acceptance
+        commits K+1 tokens. Rather than track a cached length per request and
+        assemble a ragged catch-up batch, each round simply re-feeds the
+        second-to-last committed token alongside the last one, which closes a
+        deficit that is provably never larger than 1.
+
+        Re-feeding a position is unconditionally safe, not merely safe when the
+        draft is behind. The K/V a layer computes for position i depends only on
+        the tokens at `0..i`, all of which are already correct in the cache, so
+        on the rounds where the draft was not behind the extra row rewrites the
+        identical bytes. The cost is one extra row per request through a 42M
+        parameter model.
+
+        Note a stale draft cache would cost acceptance rate and never
+        correctness: rejection sampling returns the target's distribution for
+        *any* q, provided q is the distribution the token was actually drawn
+        from — which it is here by construction, whatever the cache held.
+        """
+        assert self.draft_model is not None, (
+            "propose() needs a draft model; construct the engine with "
+            "use_speculative_decoding=True"
+        )
+        num_speculative = self.config.num_speculative_tokens
+
+        proposals: list[list[int]] = [[] for _ in requests]
+        q_rows: list[torch.Tensor] = []
+
+        for step in range(num_speculative):
+            rows = []
+            for req, proposal in zip(requests, proposals):
+                base = len(req.tokens) - 1
+                if step == 0:
+                    assert len(req.tokens) >= 2, (
+                        f"request {req.id} holds {len(req.tokens)} token(s); a decode "
+                        f"step only runs once prefill has emitted one, so there are "
+                        f"always at least two"
+                    )
+                    rows.append([(req.tokens[-2], base - 1), (req.tokens[-1], base)])
+                else:
+                    rows.append([(proposal[-1], base + step)])
+
+            input_ids, ctx = self._build_paged_rows(requests, rows)
+            logits = self.draft_model(ctx, input_ids, ctx.positions)
+
+            if step == 0:
+                # Two rows per request; only the second one predicts a new token.
+                logits = logits.view(len(requests), 2, -1)[:, 1]
+
+            probs = self.sampler.greedy_probs(logits)
+            q_rows.append(probs)
+            for i, token in enumerate(probs.argmax(-1).tolist()):
+                proposals[i].append(token)
+
+        return proposals, torch.stack(q_rows, dim=1)
+
+    @torch.inference_mode()
+    def execute_speculative(self, batch: Batch) -> tuple[list[list[int]], list[int]]:
+        """One speculative round: propose -> verify -> rejection-sample.
+
+        Returns `(tokens, num_accepted)`. `tokens[i]` is between 1 and K+1 token
+        ids for request i and `num_accepted[i]` is how many of its K proposals
+        survived; committing them is the scheduler's job, so this method leaves
+        `req.tokens` alone.
+
+        The caller must already have reserved K tokens of slack per request with
+        `allocate_block_for_decode(req, extra_tokens=K)`, because both the draft
+        steps and the verify pass write KV past the last committed token.
+        """
+        requests = batch.requests
+        for req in requests:
+            sampling_params = req.sampling_params
+            assert sampling_params.top_k <= 0 and sampling_params.top_p >= 1.0, (
+                f"request {req.id} asks for top-k/top-p sampling, which the speculative "
+                f"path does not implement. Rejection sampling has to compare the exact "
+                f"distribution the non-speculative path would have sampled from, and for "
+                f"top-k/top-p that distribution lives inside flashinfer's fused kernel, "
+                f"which never exposes it. Greedy (top_k=0, top_p=1.0 — Sampler.forward's "
+                f"argmax branch) is what this path reproduces and what every correctness "
+                f"gate runs."
+            )
+
+        proposals, q = self.propose(requests)
+        target_logits = self.verify(requests, proposals)
+        p = self.sampler.greedy_probs(target_logits)
+
+        draft_tokens = torch.tensor(proposals, dtype=torch.int64, device=q.device)
+        results = self.sampler.rejection_sample(draft_tokens, q, p, self.spec_generator)
+        return [tokens for tokens, _ in results], [num for _, num in results]
 
     @staticmethod
     def _build_block_table(requests: list[Request]) -> torch.Tensor:
@@ -365,7 +504,7 @@ class Executor:
         return logits
 
     def decode(self, ctx: Context, input_ids: torch.Tensor) -> torch.Tensor:
-        if self.config.use_cuda_graph and self.graph_runner.max_batch_size >= input_ids.size(0):
+        if self.graph_runner is not None and self.graph_runner.max_batch_size >= input_ids.size(0):
             logits = self.graph_runner.replay(ctx, input_ids)
         else:
             logits = self.model(ctx, input_ids, ctx.positions)
@@ -387,6 +526,20 @@ class Executor:
             input_ids, ctx = self._build_decode_input(batch.requests)
 
         logits = self.forward(ctx, input_ids)
+
+        if batch.type == Batch.PREFILL and self.draft_model is not None:
+            # The draft must enter its first proposal step holding KV for the
+            # same prefix the target holds, so it prefills alongside the target
+            # over the identical Context — legitimate because the two caches are
+            # addressed by the same block ids (see _init_kv_cache). Its logits
+            # are discarded: a round's first proposal comes from a draft decode
+            # step, not from here.
+            #
+            # This also runs during _warmup_model, which is deliberate — it puts
+            # the draft's activation peak into the figures _init_kv_cache sizes
+            # the cache against, where Phase 3 left it unaccounted for.
+            self.draft_model(ctx, input_ids, ctx.positions)
+
         output_tokens = self.sample(logits, batch)
         return output_tokens
     

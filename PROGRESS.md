@@ -30,7 +30,14 @@ This file is a concise handoff log for LLM agents. It tracks progress against [s
   >= 6** — a shared-memory race in the backend's decode kernel, unrelated to
   speculative decoding. The latter is root-caused and fixed; see the backend-bug
   section. The fix is a required patch, kept in `patches/`.
-- **Phase 5 is next.** Start at RESUME HERE.
+- **Phase 5: complete and gated on GPU (2026-08-04).** The engine decodes
+  speculatively end to end — draft proposes, target verifies, rejection
+  sampling commits between 1 and K+1 tokens per request. Greedy output is
+  byte-identical to non-speculative decoding at K=4 and K=8, at both 0% and
+  100% acceptance. See Phase 5 Results.
+- **Phase 6 is next.** Most of its work is already done by
+  `experiments/spec_round_gate.py`; what remains is making it a pytest file.
+  Start at RESUME HERE.
 
 ## Phase 2 Results (2026-08-03, CPU, Qwen3-0.6B float32)
 
@@ -247,12 +254,143 @@ decode walk and a batch-5 verify walk lay down slightly different K/V and drift
 apart over dozens of rounds. An earlier free-running version of this gate
 failed for exactly that reason and was measuring drift, not correctness.
 
-**Phase 6 will hit this.** Its planned exit criterion — byte-identical greedy
-output with speculation on and off — is not achievable in bf16 once Phase 5
-makes speculation actually change batch shapes. (Phase 3's gate passed only
-because the draft was loaded and never run, leaving shapes identical.) Either
-run that gate in float32 or restate it as distributional equivalence plus
-near-tie classification, as gate 3 does here.
+**Predicted here, and partly overturned by Phase 5.** This section originally
+concluded that byte-identical greedy output with speculation on and off would be
+unachievable in bf16 once speculation changed batch shapes, and that Phase 6's
+exit criterion had to be rewritten. Measured in Phase 5, the output *is*
+byte-identical in every configuration tried. The mechanism described above is
+real — batch shape does move logits by up to 0.5 — but changing an emitted token
+needs that perturbation to land on a near-tie, which Qwen3-0.6B's greedy argmax
+usually is not. So the criterion stands as written, with a documented tolerance
+and the near-tie classification kept. See "About Phase 6's exit criterion" under
+Phase 5 Results.
+
+## Phase 5 Results (2026-08-04, RTX 3050 4 GB)
+
+```
+python experiments/spec_round_gate.py          # K=4 -> GATE: PASS
+python experiments/spec_round_gate.py --k 8    # K=8 -> GATE: PASS
+```
+
+### The headline
+
+**Greedy output is byte-identical with speculation on and off**, at K=4 and
+K=8, for both prompts, at 0% and at 100% acceptance. This is stronger than the
+Phase 4 note predicted was achievable — see "About Phase 6's exit criterion"
+below, which is now a much narrower caveat than it was.
+
+| draft | K | acceptance | tokens/request/step | output |
+|---|---|---|---|---|
+| random-init tiny Qwen3 | 4 | 0.0% | 1.00 | identical |
+| random-init tiny Qwen3 | 8 | 0.0% | 1.00 | identical |
+| target drafting for itself | 4 | 100.0% | 4.70 | identical |
+| target drafting for itself | 8 | 99.0% | 7.83 | identical |
+
+The two drafts are chosen to sit at opposite extremes, because they exercise
+different code. The random draft is rejected at i=0 in every round, so every
+round takes the residual-resample path and abandons the entire proposal region
+as stale. The self-draft accepts every proposal, which is the **only** regime
+where the draft finishes a round behind the committed sequence and its catch-up
+row does real work; if that row were wrong the draft would propose from a stale
+cache and acceptance would collapse after round one. It does not.
+
+The one rejected proposal at K=8 is worth reading rather than filing as noise:
+the draft ran at batch width 2 and the target's verify pass at width 9, so at a
+near-tie their argmaxes disagreed. Rejection sampling did exactly its job —
+rejected, resampled the target's token, and the output stayed identical. That is
+the algorithm being indifferent to draft quality, observed directly.
+
+### What Phase 5 added
+
+- `Sampler.rejection_sample(draft_tokens, q, p, generator)` — the Phase 2
+  prototype's pure function, batched across requests. `Sampler.forward` is
+  untouched; plain decode still runs it. `Sampler.greedy_probs` renders
+  temperature 0 as a one-hot distribution so greedy takes the general
+  rejection-sampling path rather than a shortcut, as Phase 2 established.
+- `Executor.propose(requests) -> (proposals, q)` — K sequential draft steps.
+- `Executor.execute_speculative(batch) -> (tokens, num_accepted)` — one round.
+  It does not commit; the scheduler does.
+- `Executor._build_paged_rows` — `_build_verify_input` refactored onto a shared
+  builder that takes an explicit (token, position) list per request, which the
+  draft's steps also use. The Phase 4 gate re-passes unchanged against it.
+- The draft now prefills alongside the target in `Executor.execute`, over the
+  identical `Context` — legitimate because the two caches share block ids. This
+  also runs during warmup, which puts the draft's activation peak into the
+  numbers `_init_kv_cache` sizes against; Phase 3 had left that unaccounted.
+- `Scheduler.update(batch, tokens) -> list[int]` now takes a **list per
+  request** and returns how many tokens it actually committed. It stops
+  committing at EOS or max_tokens mid-round and drops the rest.
+- `Scheduler.decode_extra_tokens` — the decode path allocates `K` tokens of
+  slack, and the *preemption check* sees the same number, so a round can never
+  be scheduled into a cache that has no room for its proposals.
+- `Metrics` counts committed tokens rather than batch width, and tracks
+  `acceptance_rate` and `tokens_per_request_step`. The latter is deliberately
+  per request, not per batch step, or the batch width would be folded into the
+  number Phase 7 is trying to chart.
+- CUDA graphs are now *skipped* rather than captured-and-unused when
+  speculation is on. Every graph is captured for one query row per request and
+  a round runs K+1, so none could ever be replayed.
+
+### Two bugs fixed on the way
+
+- `cache_block_if_needed` indexed `req.blocks[-1]`, which is the block holding
+  the last *token* only when a request holds exactly `cdiv(len, block_size)`
+  blocks. A speculative round reserves K tokens of slack, so it can hold
+  trailing empty blocks and the hash would have landed on the wrong one. Now
+  indexed by the last token's position — provably identical in every
+  non-speculative case.
+- The gate script's round recorder held a *bound* method of the executor, which
+  pinned the model weights and KV cache of every engine it had wrapped. On a
+  4 GB card the third engine then had no memory to size a cache against. Worth
+  recording because the symptom — "not enough VRAM" — pointed nowhere near it.
+
+### Scope: greedy only, deliberately
+
+`execute_speculative` asserts `top_k <= 0 and top_p >= 1.0`. Rejection sampling
+must compare the *exact* distribution the non-speculative path would have
+sampled from, and for top-k/top-p that distribution is constructed inside
+flashinfer's fused kernel, which never exposes it. Reconstructing it outside
+would be a second implementation to keep in sync, and every correctness gate in
+this project is greedy. Note temperature needs no special handling: with top-k
+and top-p unset, `Sampler.forward` takes its argmax branch whatever the
+temperature, because scaling logits cannot move the argmax — so one-hot `p` is
+the faithful reproduction of it.
+
+Speculative decoding is also asserted incompatible with prefix caching (off by
+default). A multi-token commit can step over the block boundary that
+`cache_block_if_needed` hashes on, leaving a gap in the prefix chain.
+
+### Known limits, for Phase 7
+
+- **`p` and `q` are dense over the vocabulary.** A round materialises
+  `(B, K+1, V)` and `(B, K, V)` float32 tensors — at B=8, K=8 and Qwen3's 151936
+  vocab that is ~85 MiB per round, and it grows linearly in `max_num_batched_seqs`.
+  For greedy specifically this is nearly all waste, since one-hot rows carry
+  `B*(K+1)` integers of information. It is kept because representing temperature
+  0 as a distribution is what makes greedy run the *general* rejection-sampling
+  path, which is the property the whole correctness argument rests on (Phase 2).
+  If Phase 7 wants wide batches, the fix is a fused kernel that never
+  materialises the one-hot, not a greedy special case in the sampler.
+- Nothing here has been run at the stock `max_num_batched_seqs=512`, and the
+  point above is the first thing that would break there.
+- The draft's proposal loop is K sequential forward passes. It is the obvious
+  target once acceptance rate is worth optimising, and it is why a *trained*
+  draft (Phase 1) matters: at 0% acceptance those K passes are pure overhead,
+  which is exactly what the random-draft row of the table above shows.
+
+### About Phase 6's exit criterion
+
+Phase 4 predicted byte-identical greedy output would be unachievable once
+speculation changed batch shapes. Measured, it is achievable here — 4 runs, 2
+prompts, K in {4, 8}, both acceptance extremes, all identical. The prediction
+was not wrong about the mechanism, only about how often it bites: the batch
+shape does move logits by up to 0.5 absolute, but flipping an emitted token
+additionally requires landing on a near-tie, and Qwen3-0.6B's greedy argmax is
+usually not that close. So the criterion is **usable as written, with a
+documented tolerance** rather than as an unconditional guarantee — a longer run,
+another model, or another K may well produce a near-tie flip, and that is not a
+bug. `spec_round_gate.py`'s gate 2 already classifies exactly this: it saw 2
+near-tie reorderings at K=8 and 0 at K=4, none of which changed the output.
 
 ## Backend bug found and FIXED: decode was nondeterministic at width >= 6
 
@@ -483,53 +621,61 @@ design or the algorithm either.
 
 # RESUME HERE
 
-The environment is built and Phases 0, 2, 3 and 4 are done. **Next work is
-Phase 5: rejection sampling in the engine plus bookkeeping.**
+The environment is built and Phases 0, 2, 3, 4 and 5 are done. Speculative
+decoding **works end to end**. **Next work is Phase 6: turn the correctness
+harness into a committed pytest regression test.**
 
-### Step 0 — confirm the stack still works (5 minutes)
+### Step 0 — confirm the stack still works (10 minutes)
 
 ```
 python experiments/engine_spec_gate.py --compare --cuda-graph   # GATE: PASS - byte-identical
 python experiments/verify_pass_gate.py                          # GATE: PASS
+python experiments/spec_round_gate.py                           # GATE: PASS
 ```
 
 The first exercises both models, the paged cache, prefill, decode, CUDA graphs
-and greedy sampling. The second exercises the Phase 4 verify pass. If either
-fails, fix it before touching Phase 5 — a broken backend misread as a
-rejection-sampling bug is the exact trap this phase ordering exists to avoid.
+and greedy sampling. The second exercises the Phase 4 verify pass in isolation.
+The third is the full speculative round. If any fails, fix it before building on
+top — a broken backend misread as a rejection-sampling bug is the exact trap
+this phase ordering exists to avoid, and
+`python experiments/decode_determinism_check.py` settles that question in one
+run (it fails loudly if a backend rebuild dropped
+`patches/mini-flash-attention-decode-race.patch`).
 
 If the environment needs rebuilding, the recipe is in Environment State above;
 the load-bearing detail is **CUDA 12.6, MSVC toolset 14.44**.
 
-### Step 1 — Phase 5
+### Step 1 — Phase 6
 
-The pieces are all in place: `Executor.verify()` returns
-`(num_requests, K+1, vocab_size)` logits, and `rejection_sample()` in
-`experiments/spec_decode_prototype.py` was written as a pure function
-specifically to be ported unchanged. In order:
+Most of the work already exists. `experiments/spec_round_gate.py` is the
+correctness harness the plan asks for, and it passes; what Phase 6 adds is
+making it a *committed regression test* in the sense
+`tests/test_block_manager.py` is one. In order:
 
-1. Port `rejection_sample` into `Sampler` as a **new** method. Do not touch the
-   existing `forward` — plain decode uses it.
-2. Add a draft-proposal loop. The draft shares the target's block ids
-   (Phase 3), so it can reuse `_build_decode_input` against
-   `self.draft_kv_cache`; it needs K sequential single-token steps.
-3. Wire the round into `Engine.step` / `Executor`: propose -> verify ->
-   rejection-sample -> append `num_accepted + 1` tokens. Note
-   `Scheduler.update` currently appends exactly one token per request and
-   `Metrics` assumes the same; both need to take a count.
-4. Call `allocate_block_for_decode(req, extra_tokens=K)` before each verify
-   pass — the slots for the proposals must exist before the pass writes them.
+1. Move gates 1 and 2 into `tests/test_spec_decode_correctness.py`. Gate 1 is
+   CPU-only and needs no checkpoints, so it should run anywhere. Gate 2 needs
+   the GPU and the target checkpoint — mark it so it skips cleanly rather than
+   erroring when either is absent.
+2. Decide what the end-to-end gate does in CI. It needs two model loads and
+   several minutes; a `--slow`-style opt-in marker is the usual answer.
+3. Note `tests/` has no conftest and no pytest config, and
+   `tests/test_block_manager.py` **already fails** at HEAD — it assumes
+   `support_prefix_cache=True` while the default is `False`. That is unrelated
+   to any of this, but it means "the test suite passes" is not currently a
+   meaningful statement and Phase 6 should either fix or explicitly quarantine
+   it before adding to the suite.
 
 Two things to respect, both measured:
 
 - **The backend patch must be applied.** `patches/README.md`. Without it decode
   is nondeterministic above width 6 and every gate here becomes meaningless.
-  `python experiments/decode_determinism_check.py` confirms it in one run.
-- **Do not expect byte-identical output** against non-speculative greedy once
-  speculation changes batch shapes; see "Why the gate is not byte-identical
-  greedy output". Phase 6's exit criterion needs restating. This is unrelated to
-  the race above and was *not* fixed by the patch — it is cuBLAS retiling the
-  linear layers per batch shape, and it remains at 0.5 absolute.
+- **Byte-identical greedy output is a tolerance, not a guarantee.** It holds in
+  every configuration measured so far (see Phase 5 Results), but batch shape
+  moves logits by up to 0.5 absolute and a near-tie can flip an emitted token
+  without anything being wrong. Keep the near-tie classification rather than
+  asserting bitwise equality blindly. This is cuBLAS retiling the linear layers
+  per batch shape; it is unrelated to the decode race and was not fixed by the
+  patch.
 
 ## Phase Checklist
 
@@ -544,18 +690,24 @@ Two things to respect, both measured:
   `flash_attn_with_kvcache` with K+1 tokens in the batch dimension — *not*
   through `flash_attn_varlen_func`, which cannot express the shape. See Phase 4
   Results.
-- Phase 5: **next.** Port `rejection_sample` from the Phase 2 prototype; see
-  Step 1 above.
-- Phase 6: not started. **Its exit criterion needs restating** — byte-identical
-  greedy output is not achievable in bf16 across differing batch shapes.
+- Phase 5: **complete and gated on GPU.** `Sampler.rejection_sample`,
+  `Executor.propose` / `execute_speculative`, multi-token commit through the
+  scheduler, acceptance-rate metrics. Greedy output byte-identical with
+  speculation on and off at K=4 and K=8, at 0% and 100% acceptance. See Phase 5
+  Results.
+- Phase 6: **next**, and mostly done — `experiments/spec_round_gate.py` is the
+  harness; what remains is committing it as a pytest regression test. Its exit
+  criterion survives as written, but as a **tolerance**: byte-identical greedy
+  output holds everywhere measured, though a near-tie flip is possible and is
+  not a bug. See Step 1 above.
 - Phase 7: needs a trained draft model (Phase 1). No longer blocked on the
   decode race — the verify pass is verified clean at K=4, 8 and 16, so the
   sweep can vary K freely.
 
 ## Handoff Notes for Agents
 
-- **Start at "RESUME HERE" above.** The environment is built; next work is
-  Phase 4.
+- **Start at "RESUME HERE" above.** The environment is built and speculative
+  decoding runs end to end; next work is Phase 6.
 - Read [speculative-decoding-plan.md](speculative-decoding-plan.md) first.
 - [experiments/engine_spec_gate.py](experiments/engine_spec_gate.py) is the
   engine-level correctness gate and the fastest way to confirm the stack is

@@ -11,6 +11,11 @@ measurements" at the bottom — that section supersedes the reasoning in the
 middle of this document, which is kept because the record of *why* the wrong
 conclusion looked right is worth having.
 
+Status note, 2026-08-04: this is a **feasibility** document and stops being the
+interesting one once the thing is built. Phase 5 has since landed and the engine
+decodes speculatively end to end. `PROGRESS.md` is the source of truth for
+status; nothing measured since contradicts the Phase 4 section below.
+
 ## Summary of the revision
 
 The 2026-07-19 note closed Phase 0 as a **no-go**, on the grounds that

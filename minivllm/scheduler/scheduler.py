@@ -18,6 +18,26 @@ class Scheduler:
         self.waiting: deque[Request] = deque()
         self.running: deque[Request] = deque()
 
+        # Slack a decode step needs beyond its one committed token. A
+        # speculative round writes KV for K proposed tokens before anyone knows
+        # how many will be accepted, so those slots must exist before it runs —
+        # and the preemption check below has to know about them too, or the
+        # round allocates into a cache that was scheduled as full. Zero when
+        # speculation is off, which leaves the decode path exactly as it was.
+        self.decode_extra_tokens = (config.num_speculative_tokens
+                                    if config.use_speculative_decoding else 0)
+
+        if config.use_speculative_decoding:
+            # A speculative round can commit several tokens at once and so may
+            # step straight over a block boundary without landing on it, which
+            # is the event prefix-cache hashing keys off. The two features are
+            # untested together; prefix caching is off by default.
+            assert not self.block_manager.support_prefix_cache, (
+                "speculative decoding and prefix caching have not been validated "
+                "together — a multi-token commit can skip the block boundary that "
+                "cache_block_if_needed hashes on, leaving a gap in the prefix chain"
+            )
+
 
     @property
     def finished(self):
@@ -62,9 +82,10 @@ class Scheduler:
         :return: None
         """
         reqs = []
+        extra = self.decode_extra_tokens
         while self.running and len(reqs) < self.max_num_batched_seqs:
             req = self.running.popleft()
-            while not self.block_manager.can_allocate_new_block(req):
+            while not self.block_manager.can_allocate_new_block(req, extra):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -72,7 +93,7 @@ class Scheduler:
                     break
 
             if req.state == Request.RUNNING:
-                self.block_manager.allocate_block_for_decode(req)
+                self.block_manager.allocate_block_for_decode(req, extra)
                 reqs.append(req)
         if reqs:
             self.running.extendleft(reversed(reqs))
@@ -98,15 +119,36 @@ class Scheduler:
         self.waiting.appendleft(req)
 
 
-    def update(self, batch: Batch, tokens: list[int]):
-        for req, token in zip(batch.requests, tokens):
-            req.append_output_token(token)
+    def update(self, batch: Batch, tokens: list[list[int]]) -> list[int]:
+        """Commit a step's output tokens to each request.
 
-            eos_reached = self.eos_token_ids and token in self.eos_token_ids
-            max_len_reached = len(req.completion_tokens) >= req.sampling_params.max_tokens
-            if  max_len_reached or (eos_reached and not req.sampling_params.ignore_eos):
-                req.state = Request.FINISHED
+        `tokens[i]` is a *list* because a speculative round emits between 1 and
+        K+1 tokens per request; prefill and plain decode pass a single-element
+        list. Returns how many tokens were actually committed per request, which
+        is short of what was offered whenever the round ran past the end of the
+        sequence — the tokens a round produced after an EOS or after max_tokens
+        belong to a continuation that will never be generated, so they are
+        dropped rather than emitted. Their KV stays in the cache and is never
+        read; the request is finished and its blocks are freed below.
+        """
+        committed = []
+        for req, new_tokens in zip(batch.requests, tokens):
+            count = 0
+            for token in new_tokens:
+                req.append_output_token(token)
+                count += 1
+
+                eos_reached = self.eos_token_ids and token in self.eos_token_ids
+                max_len_reached = len(req.completion_tokens) >= req.sampling_params.max_tokens
+                if  max_len_reached or (eos_reached and not req.sampling_params.ignore_eos):
+                    req.state = Request.FINISHED
+                    break
+
+            if req.finished:
                 self.block_manager.deallocate(req)
                 self.running.remove(req)
             else:
                 self.block_manager.cache_block_if_needed(req)
+
+            committed.append(count)
+        return committed

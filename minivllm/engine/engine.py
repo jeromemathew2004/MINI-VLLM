@@ -28,9 +28,25 @@ class Engine:
 
     def step(self) -> Batch:
         batch = self.scheduler.schedule()
-        tokens = self.executor.execute(batch)
-        self.scheduler.update(batch, tokens)
-        self.metrics.update(batch)
+
+        if batch.type == Batch.DECODE and self.config.use_speculative_decoding:
+            # A speculative round emits between 1 and K+1 tokens per request,
+            # so everything downstream of it takes a list per request. Prefill
+            # is never speculative: the draft has nothing to propose from until
+            # the target has emitted a token, and it prefills alongside the
+            # target inside Executor.execute.
+            tokens, num_accepted = self.executor.execute_speculative(batch)
+            committed = self.scheduler.update(batch, tokens)
+            self.metrics.update(
+                batch, committed,
+                num_proposed=len(batch.requests) * self.config.num_speculative_tokens,
+                num_accepted=sum(num_accepted),
+            )
+        else:
+            tokens = self.executor.execute(batch)
+            committed = self.scheduler.update(batch, [[token] for token in tokens])
+            self.metrics.update(batch, committed)
+
         return batch
 
     @property
@@ -58,14 +74,18 @@ class Engine:
 
             if pbar:
                 s = self.metrics.stats()
-                pbar.set_postfix({
+                postfix = {
                     "Prefill(token/s)": f"{s.prefill_throughput:4.0f}",
                     "Decode(token/s)": f"{s.decode_throughput:4.0f}",
                     "TTFT": f"{s.time_to_first_token:4.2f}",
                     "ITL": f"{s.inter_token_latency:4.2f}",
                     "TPS": f"{s.tokens_per_second:4.2f}",
                     "RPS": f"{s.requests_per_second:4.2f}",
-                })
+                }
+                if self.config.use_speculative_decoding:
+                    postfix["Accept"] = f"{s.acceptance_rate:4.1%}"
+                    postfix["Tok/step"] = f"{s.tokens_per_request_step:4.2f}"
+                pbar.set_postfix(postfix)
                 pbar.update(s.finished_requests - stats.finished_requests)
                 stats = s
 
