@@ -14,8 +14,11 @@ This file is a concise handoff log for LLM agents. It tracks progress against [s
   [experiments/spec_decode_prototype.py](experiments/spec_decode_prototype.py)
   implements draft-and-verify on plain HF models; both gates pass. Results
   below.
-- Phase 1 (draft model training) is **deliberately deferred** — see ordering
-  note below.
+- **Phase 1 (draft model training) was deliberately deferred, and is now the
+  next work.** Correctness never needed it; acceptance rate is all it buys, and
+  that is now the only thing between this feature and a speedup. Its objective
+  is respecified — **distil from the target**, do not pretrain on a general
+  corpus. Recipe in RESUME HERE step 1.
 - **Phase 3: complete and validated on GPU (2026-08-03).** The environment is
   built, the engine runs, and the exit criterion passes byte-identically. See
   Phase 3 Validation.
@@ -405,7 +408,7 @@ near-tie reorderings at K=8 and 0 at K=4, none of which changed the output.
 ```
 pytest tests/ -m "not gpu"   # 8 passed   — no CUDA, no checkpoints, ~15 s
 pytest tests/                # 14 passed  — adds the one-round GPU tests, ~40 s
-pytest tests/ --slow         # 16 passed  — adds the engine comparison, ~75 s
+pytest tests/ --slow         # 17 passed  — adds the engine comparison, ~85 s
 ```
 
 ### The suite
@@ -818,18 +821,34 @@ too coarse a quantum when the whole budget is ~1.6 GB.
   Results. Any later divergence from greedy is an engine-integration bug, not
   an algorithm bug. That separation is the whole point of doing Phase 2 first.
 
-## Deviation from the plan, and why
+## Deviations from the plan, and why
 
-**Phase 1 (train the draft model) is deferred until after Phase 6.**
+**1. Phase 1 (train the draft model) was deferred until after Phase 6.** Done as
+intended; it is now the next work.
 
 Rejection sampling returns the target model's exact distribution regardless of
 draft quality — a poor draft lowers the acceptance rate but can never change
-the output tokens. So the entire correctness effort (Phases 2, 4, 5, 6) can be
-driven by a randomly-initialised tiny Qwen3 sharing the target's vocabulary,
-and a trained draft is only needed for Phase 7's speedup numbers.
+the output tokens. So the entire correctness effort (Phases 2, 4, 5, 6) was
+driven by a randomly-initialised tiny Qwen3 sharing the target's vocabulary, and
+a trained draft is needed only for the speedup.
 
 Phase 2 confirms this empirically: the random-init draft achieved 0% acceptance
-and still reproduced greedy output exactly, across all three K values.
+and still reproduced greedy output exactly, across all three K values. Phases 5
+and 6 confirm it through the engine.
+
+**2. Phase 1's training objective is respecified: distillation from the target,
+not pretraining on a general corpus.** The plan says a web-text or
+instruction corpus is fine because the draft's usefulness "is measured entirely
+by acceptance rate against the target, not by its own perplexity" — which is
+true, and is the reason the conclusion does not follow. If acceptance against
+the target is the metric, agreement with the target is the objective. See
+RESUME HERE step 1 for the recipe and the reasoning.
+
+**3. Phase 4's verify mechanism** is the decode kernel with K+1 tokens in the
+batch dimension, not `flash_attn_varlen_func` — see Phase 4 Results.
+
+**4. The draft's KV cache is paged and shares the target's block ids**, rather
+than being the separate contiguous tensor the plan calls for — see Phase 3.
 
 ## Blockers
 
@@ -846,7 +865,7 @@ remains is Phase 1 (train the draft) and Phase 7 (benchmark).
 ### Step 0 — confirm the stack still works (10 minutes)
 
 ```
-pytest tests/ --slow                                            # 16 passed
+pytest tests/ --slow                                            # 17 passed
 python experiments/engine_spec_gate.py --compare --cuda-graph   # GATE: PASS - byte-identical
 ```
 
@@ -861,31 +880,97 @@ run (it fails loudly if a backend rebuild dropped
 If the environment needs rebuilding, the recipe is in Environment State above;
 the load-bearing detail is **CUDA 12.6, MSVC toolset 14.44**.
 
-### Step 1 — Phase 1, and it is now the binding constraint
+### Step 1 — Phase 1: train the draft, by DISTILLATION not plain pretraining
 
 CUDA graphs for the speculative path are **done** (see the section above), so
 acceptance rate is finally the thing that decides whether the feature pays.
-Break-even is **~50% at K=2** and **~60% at K=4**; anything above those is
-speedup, up to a ceiling of ~1.7x / ~2.2x.
 
-Phase 1 as the plan specifies it would probably undershoot that, and the reason
-is worth stating before starting. The plan says the draft's training data
-"doesn't need to match Qwen3's training data — a general web text or
-instruction-style corpus is fine," on the grounds that the draft's job is to
-propose plausible continuations. Half right: acceptance is not "is the draft a
-decent LM", it is "does the draft's distribution match *the target's* at this
-position", and those come apart. A generically-trained 20M model can be a fine
-little LM and still sit well under 50% agreement with Qwen3-0.6B's argmax.
+**The target to beat: ~50% acceptance at K=2, ~60% at K=4.** Below that,
+speculation is slower than plain graphed decode. Above it, the payoff runs up to
+a ceiling of ~1.7x / ~2.2x. K=8 needs ~70% to break even at all, so aim at
+**K=2-4**.
 
-**Train it by distillation from the target** — on Qwen3-0.6B's own generations,
-or against its logits with a KL objective — rather than plain next-token
-cross-entropy on a web corpus. Same compute, aimed at the number that actually
-gates the feature. Architecture guidance from the plan stands: 10-30M
-non-embedding parameters, Qwen3's tokenizer exactly, tied embeddings so the
-151936-token vocab does not dominate the parameter count.
+#### Why the plan's Phase 1 spec would undershoot
 
-Aim at K=2-4. K=8 buys a higher ceiling but needs ~70% acceptance to break even
-at all.
+`speculative-decoding-plan.md` section 4 says the draft's training data "doesn't
+need to match Qwen3's training data — a general web text or instruction-style
+corpus is fine," because "the draft model's job is to propose plausible
+continuations, not to be a good model — its usefulness is measured entirely by
+acceptance rate against the target, not by its own perplexity."
+
+The second half of that sentence is exactly right and the conclusion drawn from
+it is exactly wrong. If usefulness is measured by acceptance against the target,
+then the training objective should be *agreement with the target*, not
+"plausible continuations." Those come apart badly: a 20M model trained on a web
+corpus can be a perfectly reasonable little LM and still sit well under 50%
+agreement with Qwen3-0.6B's argmax, because it is a different model that learned
+a different distribution. Nothing in plain next-token cross-entropy on unrelated
+text is aimed at the number that gates this feature.
+
+The literature agrees — this is DistillSpec (Zhou et al. 2023) and, for the
+cheap variant, sequence-level knowledge distillation (Kim & Rush 2016).
+
+#### The recipe, ordered by cost
+
+**Start with sequence-level distillation.** Generate a corpus *with
+Qwen3-0.6B itself* — prompts from any diverse source, completions sampled from
+the target at low temperature — then train the draft with ordinary next-token
+cross-entropy on those completions. This is the cheap variant and it matters
+disproportionately here:
+
+- **No target model resident during training.** On a 4 GB card that is close to
+  decisive: the target's bf16 weights are ~1.17 GB before any activations or
+  optimiser state, and holding it alongside a draft plus Adam moments plus
+  backward activations is a fight you do not need to pick.
+- Generation is a one-off cost, reusable across every training run and every
+  architecture you try.
+- It is ordinary CE training, so the plan's existing loop needs no change —
+  only its *data* changes.
+
+**Upgrade to logit distillation only if acceptance falls short.** Train against
+the target's top-k logits with a KL objective rather than against its sampled
+token. Strictly more signal per token, and the standard way to squeeze out the
+last few points. Two ways to pay for it:
+
+- *Offline*: cache top-k logits during corpus generation. At top-32 that is
+  ~192 bytes/token (fp16 value + int32 index), so ~1.9 GB per 10M tokens — chunky
+  but it keeps the target out of the training process.
+- *Online*: run the target in the training loop. Cleanest and most flexible;
+  needs the VRAM headroom this host does not obviously have.
+
+#### Architecture — the plan's guidance stands
+
+10-30M non-embedding parameters, **Qwen3's tokenizer exactly** (`Config` asserts
+matching vocab size, and a mismatch would be silent corruption rather than a
+crash), tied embeddings so the 151936-token vocab does not dominate the
+parameter count. `experiments/make_random_draft.py` already builds a Qwen3 of
+this shape and self-checks the tokenizer against the target's — reuse it for the
+model definition and add a training loop, rather than starting from scratch.
+
+Note the existing random draft is 42.0M total / **3.1M non-embedding**, which is
+below the plan's 10-30M band. It was sized to make the correctness harness fast,
+not to be accepted. Expect to grow it.
+
+#### Measure acceptance early and often — the loop already exists
+
+Do not train to convergence before finding out whether it is working. Acceptance
+is already instrumented end to end:
+
+```
+python experiments/spec_round_gate.py --draft <path>    # prints acceptance + histogram
+python experiments/spec_breakeven.py --end-to-end spec_graph
+```
+
+`Metrics` tracks `acceptance_rate` and `tokens_per_request_step` live, and
+`spec_round_gate.py`'s gate 3 prints the full acceptance histogram, so you can
+see whether the draft is being rejected at i=0 every round or getting partway.
+Checkpoint early, measure, and only then decide whether to scale the model or
+the data. A run that ends at 35% acceptance is a run that should have been
+stopped and rethought at 20%.
+
+Also re-run the correctness suite with the new draft — `pytest tests/ --slow`
+— since a *good* draft exercises partial-acceptance paths that neither the
+random draft (0%) nor the self-draft (~100%) reaches.
 
 ### Step 2 — then Phase 7
 
@@ -918,9 +1003,11 @@ Two things to respect, both measured:
 
 - Phase 0: **complete — go decision recorded.** Note its identified verify path
   was wrong; corrected in Phase 4. Committed as `8f16197` on branch `test`.
-- Phase 1: **deferred by design and now the main remaining work** (see above);
-  random-init draft used meanwhile. Correctness never needed it; acceptance rate
-  is all it buys. Measure break-even first — RESUME HERE step 1.
+- Phase 1: **next, and now the binding constraint.** Correctness never needed
+  it; acceptance rate is all it buys, and acceptance rate is now the only thing
+  between this feature and a speedup. Target ~50% at K=2 / ~60% at K=4.
+  **Train it by distillation from Qwen3-0.6B, not by pretraining on a general
+  corpus** — full recipe in RESUME HERE step 1.
 - Phase 2: **complete — both gates passing**, 18/18 exact match. See results above.
 - Phase 3: **complete and validated on GPU.** Config fields,
   `load_draft_model`, dual KV-cache allocation, draft checkpoint. Exit
