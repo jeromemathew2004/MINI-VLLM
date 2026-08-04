@@ -206,14 +206,20 @@ class Executor:
         slot_mapping = []
         cache_seqlens = []
 
+        block_size = self.config.kv_cache_block_size
         for req in requests:
+            pos = len(req.tokens) - 1
             input_ids.append(req.tokens[-1])
-            positions.append(len(req.tokens) - 1)
+            positions.append(pos)
             cache_seqlens.append(len(req.tokens))
 
-            slot_base_index = req.blocks[-1] * self.config.kv_cache_block_size
-            last_block_tokens = len(req.tokens) - (len(req.blocks) - 1) * self.config.kv_cache_block_size
-            slot_mapping.append(slot_base_index + last_block_tokens - 1)
+            # Resolve the slot from the token's position rather than from
+            # req.blocks[-1]. The two agree whenever a request holds exactly
+            # cdiv(len, block_size) blocks, which is every non-speculative case,
+            # but a speculative round reserves K tokens of slack: the last block
+            # is then one no committed token lives in yet, and the old
+            # arithmetic produced a negative offset into it.
+            slot_mapping.append(req.blocks[pos // block_size] * block_size + pos % block_size)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         ctx = Context(

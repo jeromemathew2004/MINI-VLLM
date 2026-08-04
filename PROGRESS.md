@@ -39,10 +39,12 @@ This file is a concise handoff log for LLM agents. It tracks progress against [s
   pytest suite, `tests/test_spec_decode_correctness.py` +
   `tests/test_spec_decode_end_to_end.py`, and it is mutation-checked. See
   Phase 6 Results.
-- **Phase 1 (train the draft) and Phase 7 (benchmark) are what remain**, and
-  Phase 7 is blocked on Phase 1 for anything meaningful. Start at RESUME HERE —
-  it argues for measuring the break-even acceptance rate *before* paying for
-  Phase 1.
+- **Break-even measured 2026-08-04, and it redirects the plan.** Speculation is
+  currently 10-21x slower per step than a CUDA-graph decode, so break-even is
+  unreachable at *any* acceptance rate — a perfect draft still loses. The cause
+  is kernel-launch overhead: graphs are worth 7.9x here and the speculative path
+  cannot use them. **Next work is CUDA graphs for the verify and propose passes,
+  not Phase 1.** See Break-even measurement and RESUME HERE.
 
 ## Phase 2 Results (2026-08-03, CPU, Qwen3-0.6B float32)
 
@@ -456,6 +458,100 @@ inside the repo and from outside it. It also registers the markers and the
 `--slow` option, and sets `TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0` before
 torch is imported.
 
+## Break-even measurement (2026-08-04) — Phase 1 is NOT the next step
+
+```
+python experiments/spec_breakeven.py
+for m in base_eager base_graph spec; do
+    python experiments/spec_breakeven.py --end-to-end $m    # cross-check
+done
+```
+
+**Finding: speculation cannot pay off on this host until the speculative path
+can use CUDA graphs, and no amount of draft training changes that.**
+
+Batch 1, 256 tokens of context, RTX 3050:
+
+| | ms/step | vs graphed decode |
+|---|---|---|
+| plain decode, CUDA graphs | **8.7** | 1.0x |
+| plain decode, eager | 68.6 | 7.9x |
+| speculative round, K=1 | 92.7 | 10.6x |
+| speculative round, K=4 | 134.9 | 15.4x |
+| speculative round, K=8 | 188.1 | 21.5x |
+
+Break-even, against the graph-accelerated baseline that production decode
+actually runs:
+
+| K | round / T_graph | E[M] needed | acceptance needed | ceiling at 100% acceptance |
+|---|---|---|---|---|
+| 1 | 10.6 | 9.6 | **impossible** | 0.19x |
+| 2 | 12.1 | 11.1 | **impossible** | 0.25x |
+| 4 | 15.4 | 14.4 | **impossible** | 0.32x |
+| 8 | 21.5 | 20.5 | **impossible** | 0.42x |
+
+"Impossible" is not rhetorical: break-even needs E[M] larger than K, so even a
+draft that is accepted every single time leaves speculation 2.4x-5x *slower*
+than the baseline. Confirmed end to end — 191 tok/s graphed baseline against
+14 tok/s speculative.
+
+### The cause is launch overhead, not the draft
+
+CUDA graphs are worth **7.9x** on plain decode here. That is the whole story: at
+batch 1 a 0.6B model in bf16 is memory-bandwidth-bound with a floor near 6 ms,
+and the graphed step hits 8.7 ms while the eager one spends ~60 ms launching
+kernels. Windows WDDM launch cost on a laptop GPU sharing a display is brutal.
+
+Phase 5 disabled graph capture under speculation because no captured graph can
+match a K+1-row verify pass. Measured, that decision — correct in itself — is
+what makes the feature unusable, not draft quality:
+
+- `verify()` costs ~80 ms and is **flat in K** (80.6 / 81.0 / 80.9 / 75.2 ms at
+  K=1/2/4/8). Exactly as the technique predicts: K+1 rows are nearly free once
+  the weights are resident. That part works.
+- `propose()` costs ~13-15 ms **per draft step** and so grows linearly: 13.3 ms
+  at K=1 up to 124.7 ms at K=8. A 4-layer/256-hidden draft should be ~1/30 of a
+  28-layer/1024 target by FLOPs; it measures 1/5. That gap is launch overhead,
+  and it is why K=8 costs more than K=4 rather than amortising better.
+- `rejection_sample()` costs 1.8-3.9 ms — small, but ~15% of what an optimised
+  round would be, and it is all dense one-hot vocab tensors plus `.tolist()`
+  syncs. See "Known limits" under Phase 5.
+
+### The fix, and why it is tractable
+
+Phase 4's central finding was that a verify pass is *decode-shaped*: K+1 tokens
+per request ride in the **batch** dimension. So a verify pass at B requests and K
+proposals is exactly a decode call at batch width `B*(K+1)` — the same shape
+`CudaGraphRunner` already captures, with the same `Context` fields, and
+`replay()` already pads up to the next captured size with `slot_mapping = -1`.
+The draft's proposal steps are likewise decode-shaped at width B (2B on step 0),
+against the draft model.
+
+So the work is roughly:
+
+1. Give the draft model its own `CudaGraphRunner`.
+2. Route `verify()` through the target's runner when `B*(K+1)` fits a captured
+   size, instead of unconditionally calling the model eagerly.
+3. Size the runner from `max_num_batched_seqs * (K+1)` when speculation is on;
+   it is currently `max_num_batched_seqs`, which at 8 already excludes B=2, K=4.
+
+If graphs carry the same ~8x to both paths, a K=4 round lands near 19-20 ms
+against a 8.7 ms baseline — ratio ~2.2, break-even acceptance ~55%, ceiling
+~2.2x. That is an ordinary speculative-decoding regime and Phase 1 becomes worth
+doing. Until then it is not.
+
+### Caveats on these numbers
+
+- Batch 1 and 256 tokens of context. Larger batches shift things toward
+  speculation being *worse*, since a wider verify pass costs more while the
+  baseline step amortises better.
+- This is a 0.6B target. Speculative decoding is aimed at models where one
+  forward pass is expensive relative to fixed overheads; 0.6B on a laptop is
+  close to the least favourable case, and the technique's reputation comes from
+  7B+ models where launch overhead is a rounding error.
+- The microbenchmark was cross-checked against `Engine.generate` wall time and
+  the ratios agree (see the script's docstring). It is not measuring an artefact.
+
 ## Backend bug found and FIXED: decode was nondeterministic at width >= 6
 
 **Pre-existing, unrelated to speculative decoding — it reproduced on a clean
@@ -707,39 +803,45 @@ run (it fails loudly if a backend rebuild dropped
 If the environment needs rebuilding, the recipe is in Environment State above;
 the load-bearing detail is **CUDA 12.6, MSVC toolset 14.44**.
 
-### Step 1 — measure break-even BEFORE training a draft
+### Step 1 — CUDA graphs for the speculative path (was: Phase 1)
 
-The plan puts Phase 1 next. Do this first; it is an afternoon against Phase 1's
-days, and it decides whether Phase 1 can pay off at all on this hardware.
+**Measured 2026-08-04: Phase 1 is not the next step, and would be wasted effort
+right now.** See "Break-even measurement" above. Speculation currently costs
+10-21x a graph-accelerated decode step, so break-even needs more accepted tokens
+than a round even proposes — a perfect draft still leaves it 2.4x-5x slower. The
+cause is that the speculative path runs eager while the baseline runs CUDA
+graphs, and graphs are worth 7.9x here.
 
-A round costs K draft forward passes plus one verify pass at K+1 rows, and
-returns M+1 tokens. That ratio sets **the acceptance rate speculation must beat
-to break even**, and nobody has measured it. If it turns out to be 70%+ on a
-0.6B target on a 3050, a 10-30M draft may never reach it and the honest result
-is "this hardware is the wrong shape for the technique" — which is a perfectly
-good finding, but one worth having before training rather than after.
+The work, in order:
 
-What to measure: wall time of a plain decode step versus a full speculative
-round, at fixed batch width, for K in {1, 2, 4, 8}. Two cautions, both learned
-the hard way here:
+1. Give the draft model its own `CudaGraphRunner`. Its proposal steps are
+   decode-shaped at width B (2B on step 0), so nothing new is needed structurally.
+2. Route `verify()` through the target's runner. This is the part that is easier
+   than it sounds: Phase 4 established that a verify pass *is* a decode call at
+   batch width `B*(K+1)` — same `Context` fields, and `replay()` already pads to
+   the next captured size with `slot_mapping = -1`.
+3. Size the runner from `max_num_batched_seqs * (K+1)` under speculation. It is
+   currently `max_num_batched_seqs`, which at the local profile's 8 already
+   excludes B=2 at K=4.
+4. Re-run `spec_breakeven.py`. Target: a K=4 round near 20 ms, break-even
+   acceptance near 55%.
 
-- **Do not A/B it in one process.** The two `engine_spec_gate.py --compare` runs
-  show the second engine reporting far better TTFT than the first purely from
-  warm `torch.compile` and cuBLAS autotuning. Any in-process comparison flatters
-  whichever ran second.
-- Right now speculation is a **net slowdown** with the random draft, by
-  construction: 0% acceptance means every round pays K draft passes to produce
-  the one token a plain step would have. That is expected, not a defect.
+Keep `experiments/spec_breakeven.py --end-to-end` as the cross-check — a
+microbenchmark that disagrees with `Engine.generate` is measuring an artefact,
+and this one was validated that way.
 
-### Step 2 — Phase 1, then Phase 7
+### Step 2 — then Phase 1, then Phase 7
 
 Phase 1 is unchanged from the plan: train a small draft on Qwen3's tokenizer,
 10-30M non-embedding parameters, tied embeddings to keep the 151936-token vocab
-from dominating. Note the correctness harness does **not** need it — that is the
-whole reason Phase 1 was deferred — so its only job is acceptance rate.
+from dominating. The correctness harness does **not** need it — that is the whole
+reason Phase 1 was deferred — so its only job is acceptance rate, and it is only
+worth paying for once step 1 has made acceptance rate the binding constraint.
 
-Phase 7 then has something to chart. Until then a throughput sweep would only
-show speculation losing, which is already known.
+Phase 7 then has something to chart. Note its chart should include the
+break-even line, not just throughput vs K: the interesting result here is
+*why* speculation does or does not pay, and on this hardware that turns out to
+be a story about launch overhead rather than about draft quality.
 
 Two things to respect, both measured:
 
