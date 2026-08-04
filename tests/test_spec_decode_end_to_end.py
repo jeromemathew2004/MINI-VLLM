@@ -20,6 +20,14 @@ behind the committed sequence and the catch-up row in `Executor.propose` does
 real work — if that row were wrong the draft would propose from a stale cache
 and acceptance would collapse after round one.
 
+**And two workloads for the n-gram proposer**, which has no model at all and so
+gets its acceptance from the text rather than from weights. The repetitive set
+is where it lands proposals; the open-ended set is where it mostly declines, and
+declining routes through `execute_speculative`'s fallback to a plain decode step
+— a second path that none of the round-shaped assertions would otherwise reach.
+These cases need only the target checkpoint, so they are gated on
+`requires_target` rather than on the draft.
+
 **On "identical".** Byte-identical greedy output holds in every configuration
 measured so far, but it is a tolerance rather than a theorem: batch shape moves
 logits by up to 0.5 absolute (cuBLAS retiling per shape, nothing to do with
@@ -41,6 +49,12 @@ MAX_TOKENS = 48
 
 _missing = harness.missing_requirements(harness.DRAFT)
 requires_gpu = pytest.mark.skipif(bool(_missing), reason=_missing or "")
+
+# The n-gram proposer runs no model, so its tests need the target and nothing
+# else. Gating them on the draft checkpoint would silently drop the only
+# coverage of the lookup path on a machine that never generated one.
+_missing_target = harness.missing_requirements()
+requires_target = pytest.mark.skipif(bool(_missing_target), reason=_missing_target or "")
 
 
 class RoundRecorder:
@@ -246,7 +260,7 @@ def test_self_draft_reproduces_greedy(prompts, baseline):
     assert tokens == baseline(False)
 
 
-@requires_gpu
+@requires_target
 @pytest.mark.slow
 @pytest.mark.gpu
 def test_ngram_proposer_reproduces_greedy(repetitive_prompts):
@@ -283,7 +297,7 @@ def test_ngram_proposer_reproduces_greedy(repetitive_prompts):
     assert tokens == baseline
 
 
-@requires_gpu
+@requires_target
 @pytest.mark.slow
 @pytest.mark.gpu
 def test_ngram_proposer_reproduces_greedy_on_open_ended_text(prompts, baseline):
