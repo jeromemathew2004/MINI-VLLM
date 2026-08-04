@@ -35,9 +35,14 @@ This file is a concise handoff log for LLM agents. It tracks progress against [s
   sampling commits between 1 and K+1 tokens per request. Greedy output is
   byte-identical to non-speculative decoding at K=4 and K=8, at both 0% and
   100% acceptance. See Phase 5 Results.
-- **Phase 6 is next.** Most of its work is already done by
-  `experiments/spec_round_gate.py`; what remains is making it a pytest file.
-  Start at RESUME HERE.
+- **Phase 6: complete (2026-08-04).** The correctness harness is a committed
+  pytest suite, `tests/test_spec_decode_correctness.py` +
+  `tests/test_spec_decode_end_to_end.py`, and it is mutation-checked. See
+  Phase 6 Results.
+- **Phase 1 (train the draft) and Phase 7 (benchmark) are what remain**, and
+  Phase 7 is blocked on Phase 1 for anything meaningful. Start at RESUME HERE —
+  it argues for measuring the break-even acceptance rate *before* paying for
+  Phase 1.
 
 ## Phase 2 Results (2026-08-03, CPU, Qwen3-0.6B float32)
 
@@ -392,6 +397,65 @@ another model, or another K may well produce a near-tie flip, and that is not a
 bug. `spec_round_gate.py`'s gate 2 already classifies exactly this: it saw 2
 near-tie reorderings at K=8 and 0 at K=4, none of which changed the output.
 
+## Phase 6 Results (2026-08-04)
+
+```
+pytest tests/ -m "not gpu"   # 8 passed   — no CUDA, no checkpoints, ~15 s
+pytest tests/                # 14 passed  — adds the one-round GPU tests, ~40 s
+pytest tests/ --slow         # 16 passed  — adds the engine comparison, ~75 s
+```
+
+### The suite
+
+Three tiers, cheapest first, so a contributor without a GPU still gets a real
+signal and CI can pick a level:
+
+| tier | file | needs | what it pins down |
+|---|---|---|---|
+| maths | `test_spec_decode_correctness.py` | nothing | the sampler's output distribution equals the target's; `len(tokens) == num_accepted + 1`; the accepted prefix is never rewritten; greedy's degenerate behaviour |
+| one round | same file, `gpu` marker | CUDA + target | `verify()` at K=0 matches decode **bitwise**; a round emits exactly `truth[:M+1]` for M swept 0..K at 3 anchors |
+| engine | `test_spec_decode_end_to_end.py`, `slow` | CUDA + both models | greedy output identical with speculation on and off, at 0% and ~100% acceptance, with per-round invariants checked |
+
+`tests/spec_harness.py` holds the primitives. The dependency deliberately runs
+**tests → experiments**, not the reverse: `experiments/verify_pass_gate.py` and
+`experiments/spec_round_gate.py` now import from the harness rather than
+defining their own copies. A regression suite that breaks when someone edits an
+exploratory script is a regression suite nobody trusts.
+
+### Mutation-checked, because a green suite proves nothing on its own
+
+Two deliberate bugs were introduced and the suite was re-run:
+
+| mutation | caught by |
+|---|---|
+| `Sampler.rejection_sample` accepts every proposal | 7 tests — both distribution tests, the greedy degenerate test, and the round test at M=0..3 |
+| `_build_paged_rows` off by one in `cache_seqlens` | 6 tests — the bitwise `verify()` test and the round test at every M |
+
+Worth noting the first mutation left `M=K` passing, which is correct: when every
+proposal *should* be accepted, a sampler that always accepts is right by
+accident. The parametrisation is discriminating rather than uniformly loud.
+
+### tests/test_block_manager.py was failing at HEAD, and is fixed
+
+Unrelated to speculative decoding. It asserts on `hash_to_block_id` and
+`num_cached_tokens`, which only move when prefix caching is on, but constructed
+`KVCacheBlockManager` without `support_prefix_cache=True` — the default flipped
+to `False` at some point and left the test red. Fixed by asking for the flag the
+test was always testing. This mattered beyond tidiness: while the suite was red,
+"the tests pass" was not a statement anyone could make, and a new regression test
+added to a red suite is a regression test nobody reads.
+
+### Root conftest.py
+
+New, and load-bearing rather than decorative. pytest puts the directory holding
+the rootmost `conftest.py` on `sys.path`, which is what makes `import minivllm`
+and `import tests.spec_harness` resolve under any invocation. Without it,
+`pytest tests/` and `python -m pytest tests/` differ — the latter worked only
+because it happens to prepend the working directory. Both are now verified, from
+inside the repo and from outside it. It also registers the markers and the
+`--slow` option, and sets `TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0` before
+torch is imported.
+
 ## Backend bug found and FIXED: decode was nondeterministic at width >= 6
 
 **Pre-existing, unrelated to speculative decoding — it reproduced on a clean
@@ -621,22 +685,20 @@ design or the algorithm either.
 
 # RESUME HERE
 
-The environment is built and Phases 0, 2, 3, 4 and 5 are done. Speculative
-decoding **works end to end**. **Next work is Phase 6: turn the correctness
-harness into a committed pytest regression test.**
+The environment is built and Phases 0, 2, 3, 4, 5 and 6 are done. Speculative
+decoding **works end to end and is guarded by a committed test suite**. What
+remains is Phase 1 (train the draft) and Phase 7 (benchmark).
 
 ### Step 0 — confirm the stack still works (10 minutes)
 
 ```
+pytest tests/ --slow                                            # 16 passed
 python experiments/engine_spec_gate.py --compare --cuda-graph   # GATE: PASS - byte-identical
-python experiments/verify_pass_gate.py                          # GATE: PASS
-python experiments/spec_round_gate.py                           # GATE: PASS
 ```
 
-The first exercises both models, the paged cache, prefill, decode, CUDA graphs
-and greedy sampling. The second exercises the Phase 4 verify pass in isolation.
-The third is the full speculative round. If any fails, fix it before building on
-top — a broken backend misread as a rejection-sampling bug is the exact trap
+The suite is the fastest complete answer; the gate script additionally exercises
+CUDA graphs, which the tests leave off. If either fails, fix it before building
+on top — a broken backend misread as a rejection-sampling bug is the exact trap
 this phase ordering exists to avoid, and
 `python experiments/decode_determinism_check.py` settles that question in one
 run (it fails loudly if a backend rebuild dropped
@@ -645,25 +707,39 @@ run (it fails loudly if a backend rebuild dropped
 If the environment needs rebuilding, the recipe is in Environment State above;
 the load-bearing detail is **CUDA 12.6, MSVC toolset 14.44**.
 
-### Step 1 — Phase 6
+### Step 1 — measure break-even BEFORE training a draft
 
-Most of the work already exists. `experiments/spec_round_gate.py` is the
-correctness harness the plan asks for, and it passes; what Phase 6 adds is
-making it a *committed regression test* in the sense
-`tests/test_block_manager.py` is one. In order:
+The plan puts Phase 1 next. Do this first; it is an afternoon against Phase 1's
+days, and it decides whether Phase 1 can pay off at all on this hardware.
 
-1. Move gates 1 and 2 into `tests/test_spec_decode_correctness.py`. Gate 1 is
-   CPU-only and needs no checkpoints, so it should run anywhere. Gate 2 needs
-   the GPU and the target checkpoint — mark it so it skips cleanly rather than
-   erroring when either is absent.
-2. Decide what the end-to-end gate does in CI. It needs two model loads and
-   several minutes; a `--slow`-style opt-in marker is the usual answer.
-3. Note `tests/` has no conftest and no pytest config, and
-   `tests/test_block_manager.py` **already fails** at HEAD — it assumes
-   `support_prefix_cache=True` while the default is `False`. That is unrelated
-   to any of this, but it means "the test suite passes" is not currently a
-   meaningful statement and Phase 6 should either fix or explicitly quarantine
-   it before adding to the suite.
+A round costs K draft forward passes plus one verify pass at K+1 rows, and
+returns M+1 tokens. That ratio sets **the acceptance rate speculation must beat
+to break even**, and nobody has measured it. If it turns out to be 70%+ on a
+0.6B target on a 3050, a 10-30M draft may never reach it and the honest result
+is "this hardware is the wrong shape for the technique" — which is a perfectly
+good finding, but one worth having before training rather than after.
+
+What to measure: wall time of a plain decode step versus a full speculative
+round, at fixed batch width, for K in {1, 2, 4, 8}. Two cautions, both learned
+the hard way here:
+
+- **Do not A/B it in one process.** The two `engine_spec_gate.py --compare` runs
+  show the second engine reporting far better TTFT than the first purely from
+  warm `torch.compile` and cuBLAS autotuning. Any in-process comparison flatters
+  whichever ran second.
+- Right now speculation is a **net slowdown** with the random draft, by
+  construction: 0% acceptance means every round pays K draft passes to produce
+  the one token a plain step would have. That is expected, not a defect.
+
+### Step 2 — Phase 1, then Phase 7
+
+Phase 1 is unchanged from the plan: train a small draft on Qwen3's tokenizer,
+10-30M non-embedding parameters, tied embeddings to keep the 151936-token vocab
+from dominating. Note the correctness harness does **not** need it — that is the
+whole reason Phase 1 was deferred — so its only job is acceptance rate.
+
+Phase 7 then has something to chart. Until then a throughput sweep would only
+show speculation losing, which is already known.
 
 Two things to respect, both measured:
 
@@ -681,7 +757,9 @@ Two things to respect, both measured:
 
 - Phase 0: **complete — go decision recorded.** Note its identified verify path
   was wrong; corrected in Phase 4. Committed as `8f16197` on branch `test`.
-- Phase 1: deferred by design (see above); random-init draft used meanwhile.
+- Phase 1: **deferred by design and now the main remaining work** (see above);
+  random-init draft used meanwhile. Correctness never needed it; acceptance rate
+  is all it buys. Measure break-even first — RESUME HERE step 1.
 - Phase 2: **complete — both gates passing**, 18/18 exact match. See results above.
 - Phase 3: **complete and validated on GPU.** Config fields,
   `load_draft_model`, dual KV-cache allocation, draft checkpoint. Exit
@@ -695,11 +773,13 @@ Two things to respect, both measured:
   scheduler, acceptance-rate metrics. Greedy output byte-identical with
   speculation on and off at K=4 and K=8, at 0% and 100% acceptance. See Phase 5
   Results.
-- Phase 6: **next**, and mostly done — `experiments/spec_round_gate.py` is the
-  harness; what remains is committing it as a pytest regression test. Its exit
-  criterion survives as written, but as a **tolerance**: byte-identical greedy
+- Phase 6: **complete.** `tests/test_spec_decode_correctness.py` and
+  `tests/test_spec_decode_end_to_end.py`, three tiers, mutation-checked, plus a
+  root `conftest.py` and `tests/spec_harness.py`. The pre-existing
+  `test_block_manager.py` failure is fixed, so the suite is green. Its exit
+  criterion survives as written but as a **tolerance**: byte-identical greedy
   output holds everywhere measured, though a near-tie flip is possible and is
-  not a bug. See Step 1 above.
+  not a bug. See Phase 6 Results.
 - Phase 7: needs a trained draft model (Phase 1). No longer blocked on the
   decode race — the verify pass is verified clean at K=4, 8 and 16, so the
   sweep can vary K freely.

@@ -59,7 +59,6 @@ Usage:
 """
 
 import argparse
-import gc
 import logging
 import os
 import sys
@@ -72,48 +71,31 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
-from minivllm.config.config import Config  # noqa: E402
 from minivllm.config.sampling import SamplingParams  # noqa: E402
 from minivllm.engine.engine import Engine  # noqa: E402
 from minivllm.models.layers.sampler import Sampler  # noqa: E402
 
-# The Phase 4 gate owns the primitives for driving the executor by hand; reusing
-# them keeps one definition of "prefill one request and leave the cache in the
-# state a round expects".
-from experiments.verify_pass_gate import (  # noqa: E402
-    control_batch_shape_noise,
+# The primitives for driving the executor by hand live with the regression
+# suite, which is their durable home; this script is one of two consumers. See
+# tests/spec_harness.py.
+from tests.spec_harness import (  # noqa: E402
+    DRAFT,
+    PROMPTS,
+    TARGET,
+    batch_shape_noise_floor,
+    build_engine,
+    chat_prompts,
+    free_gpu_memory,
     prefill_one,
     reference_walk,
     release,
+    run_round,
+    scripted_proposal,
     sequential_steps,
 )
 
 logging.basicConfig(format="%(asctime)s: %(message)s", level=logging.INFO,
                     datefmt="%H:%M:%S")
-
-TARGET = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-DRAFT = os.path.expanduser("~/huggingface/Qwen3-draft-random/")
-
-PROMPTS = [
-    "What is the meaning of life?",
-    "How do I get started with LLMs?",
-]
-
-
-def build_config(spec: bool, draft: str, k: int) -> Config:
-    """The 4 GB RTX 3050 profile, as in experiments/engine_spec_gate.py."""
-    return Config(
-        model=TARGET,
-        max_model_len=1024,
-        max_num_batched_tokens=2048,
-        max_num_batched_seqs=8,
-        kv_cache_block_size=64,
-        gpu_memory_utilization=0.9,
-        use_cuda_graph=False,
-        use_speculative_decoding=spec,
-        draft_model=draft if spec else "",
-        num_speculative_tokens=k,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -178,27 +160,6 @@ def gate_sampler_distribution(k: int, trials: int, seed: int) -> bool:
 # gate 2 — a round with scripted acceptance
 # ---------------------------------------------------------------------------
 
-def run_round(engine: Engine, req, proposal: list[int]) -> tuple[list[int], int, torch.Tensor]:
-    """One verify + rejection-sample round on scripted proposals.
-
-    Bypasses `propose()` on purpose. `q` is built as a greedy draft's would be —
-    one-hot on the token proposed — so the only thing under test is the target's
-    side of the round.
-    """
-    sampler = engine.executor.sampler
-    engine.scheduler.block_manager.allocate_block_for_decode(req, extra_tokens=len(proposal))
-
-    target_logits = engine.executor.verify([req], [proposal])
-    p = sampler.greedy_probs(target_logits)
-
-    draft_tokens = torch.tensor([proposal], dtype=torch.int64, device=p.device)
-    q = torch.zeros(1, len(proposal), p.shape[-1], device=p.device)
-    q.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
-
-    (tokens, num_accepted), = sampler.rejection_sample(draft_tokens, q, p)
-    return tokens, num_accepted, target_logits[0]
-
-
 def gate_scripted_acceptance(engine: Engine, prompt_tokens: list[int], reference: list[int],
                              k: int, floor: float, label: str) -> tuple[int, int, int]:
     """Sweep M over 0..K and check the round emits exactly `truth[:M+1]`.
@@ -222,11 +183,10 @@ def gate_scripted_acceptance(engine: Engine, prompt_tokens: list[int], reference
             # must be accepted — precisely when it equals truth[j].
             truth, _, gaps = sequential_steps(engine, prefix, k + 1)
 
-            proposal = [t if i < num_correct else (t + 1) % vocab_size
-                        for i, t in enumerate(truth[:k])]
+            proposal = scripted_proposal(truth, num_correct, k, vocab_size)
 
             req, _ = prefill_one(engine, prefix)
-            tokens, num_accepted, _ = run_round(engine, req, proposal)
+            tokens, num_accepted = run_round(engine, req, proposal)
             release(engine, req)
 
             checked += 1
@@ -330,7 +290,7 @@ class RoundRecorder:
 
 
 def run_engine(spec: bool, draft: str, k: int, max_tokens: int, prompts: list[list[int]]):
-    engine = Engine(build_config(spec, draft, k))
+    engine = build_engine(spec=spec, draft=draft, k=k)
     recorder = RoundRecorder(engine) if spec else None
 
     # temperature 1.0 with top_k 0 and top_p 1.0 is Sampler.forward's argmax
@@ -347,8 +307,7 @@ def run_engine(spec: bool, draft: str, k: int, max_tokens: int, prompts: list[li
     if recorder is not None:
         recorder.detach()
     del engine
-    gc.collect()
-    torch.cuda.empty_cache()
+    free_gpu_memory()
     return result
 
 
@@ -412,17 +371,12 @@ def main() -> int:
     ok1 = gate_sampler_distribution(args.k, args.trials, args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(TARGET)
-    prompts = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": p}],
-            tokenize=True, add_generation_prompt=True, enable_thinking=True)
-        for p in PROMPTS
-    ]
+    prompts = chat_prompts(tokenizer)
 
     # Gate 2 drives the executor by hand and never needs the draft loaded.
-    engine = Engine(build_config(False, args.draft, args.k))
+    engine = build_engine(k=args.k)
     eos_ids = set(engine.config.eos_token_ids or set())
-    floor = control_batch_shape_noise(engine, prompts[0], args.k + 1)
+    floor = batch_shape_noise_floor(engine, prompts[0], args.k + 1, verbose=True)
 
     print("\n== gate 2: a round emits exactly what greedy decoding would ==")
     checked_total = hard_total = tie_total = 0
@@ -442,8 +396,7 @@ def main() -> int:
     print(f"   gate 2 {'PASSED' if ok2 else f'FAILED ({hard_total} hard mismatches)'}")
 
     del engine
-    gc.collect()
-    torch.cuda.empty_cache()
+    free_gpu_memory()
 
     ok3 = gate_end_to_end(args.draft, args.k, args.max_tokens, prompts,
                           "random draft: rejection at i=0 every round")

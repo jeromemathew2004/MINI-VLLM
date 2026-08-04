@@ -36,10 +36,21 @@ python run.py
 python benchmark/run_mini_vllm.py
 python benchmark/run_vllm.py   # compares against real vLLM
 
-# Tests (pytest, no config file — just point at the tests dir)
-pytest tests/
+# Tests. The root conftest.py registers markers and puts the repo root on
+# sys.path, so any invocation and any working directory work.
+pytest tests/                  # maths + one-round GPU tests (~40 s)
+pytest tests/ -m "not gpu"     # no CUDA and no checkpoints needed (~15 s)
+pytest tests/ --slow           # adds the end-to-end engine comparison (~75 s)
 pytest tests/test_block_manager.py -v
 ```
+
+Markers: `gpu` needs a CUDA device and `~/huggingface/Qwen3-0.6B/`, and skips
+cleanly without them; `slow` builds engines and generates text, and is skipped
+unless `--slow` is passed. `tests/spec_harness.py` holds the primitives for
+driving the executor by hand (prefill one request, take N plain decode steps,
+run one scripted round) — `experiments/verify_pass_gate.py` and
+`experiments/spec_round_gate.py` import from it, so the dependency runs
+tests → experiments and never the other way.
 
 There is no lint/format tooling configured in this repo.
 

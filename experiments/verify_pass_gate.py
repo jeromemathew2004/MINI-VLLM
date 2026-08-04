@@ -19,7 +19,7 @@ has 1. So its logits *cannot* be bitwise equal to sequential decode's, no
 matter how correct it is, and any gate demanding that is measuring bf16 GEMM
 tiling rather than speculative decoding.
 
-`control_batch_shape_noise` measures that floor, and the gates below are stated
+`batch_shape_noise_floor` measures that floor, and the gates below are stated
 relative to it:
 
 **Gate 1 — context construction is exact.** `verify()` with zero proposals is a
@@ -84,111 +84,29 @@ os.environ.setdefault("TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER", "0")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import torch  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
-from minivllm.config.config import Config  # noqa: E402
-from minivllm.config.sampling import SamplingParams  # noqa: E402
 from minivllm.engine.engine import Engine  # noqa: E402
-from minivllm.engine.request import Request  # noqa: E402
-from minivllm.scheduler.batch import Batch  # noqa: E402
+
+# The primitives for driving the executor by hand live with the regression
+# suite, which is their durable home; this script is one of two consumers. See
+# tests/spec_harness.py.
+from tests.spec_harness import (  # noqa: E402
+    PROMPTS,
+    TARGET,
+    batch_shape_noise_floor,
+    build_config,
+    chat_prompts,
+    decode_logits,
+    prefill_one,
+    reference_walk,
+    release,
+    scripted_proposal,
+    sequential_steps,
+)
 
 logging.basicConfig(format="%(asctime)s: %(message)s", level=logging.INFO,
                     datefmt="%H:%M:%S")
-
-TARGET = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-
-PROMPTS = [
-    "What is the meaning of life?",
-    "How do I get started with LLMs?",
-]
-
-
-def build_config() -> Config:
-    """The 4 GB RTX 3050 profile, as in experiments/engine_spec_gate.py.
-
-    CUDA graphs stay off: they are a decode-path optimisation already shown
-    equivalent to eager in Phase 3, and leaving them out keeps exactly one
-    variable under test — one query row per request versus K+1.
-    """
-    return Config(
-        model=TARGET,
-        max_model_len=1024,
-        max_num_batched_tokens=2048,
-        max_num_batched_seqs=8,
-        kv_cache_block_size=64,
-        gpu_memory_utilization=0.9,
-        use_cuda_graph=False,
-    )
-
-
-# ---------------------------------------------------------------------------
-# driving the executor by hand
-# ---------------------------------------------------------------------------
-
-def prefill_one(engine: Engine, prompt_tokens: list[int]) -> tuple[Request, int]:
-    """Submit one request and run its prefill, returning it and its first token.
-
-    Afterwards `req.tokens` is `prompt + [first]` and the cache holds the
-    prompt — the last committed token has not been fed through the model, which
-    is the invariant every verify round assumes.
-    """
-    sp = SamplingParams(temperature=1.0, top_k=0, top_p=1.0, max_tokens=1 << 30)
-    req = Request(prompt_tokens, sp)
-    engine.scheduler.submit(req)
-    batch = engine.scheduler.schedule()
-    assert batch is not None and batch.type == Batch.PREFILL and batch.requests == [req]
-    tokens = engine.executor.execute(batch)
-    # Bypass Scheduler.update: it also runs prefix-cache bookkeeping and
-    # end-of-sequence handling, neither of which this harness wants.
-    req.append_output_token(tokens[0])
-    return req, tokens[0]
-
-
-def release(engine: Engine, req: Request) -> None:
-    if req in engine.scheduler.running:
-        engine.scheduler.running.remove(req)
-    if req.blocks:
-        engine.scheduler.block_manager.deallocate(req)
-
-
-def decode_logits(engine: Engine, requests: list[Request]) -> torch.Tensor:
-    """One plain decode step for `requests`, eager, returning (batch, vocab)."""
-    for req in requests:
-        engine.scheduler.block_manager.allocate_block_for_decode(req)
-    with torch.inference_mode():
-        input_ids, ctx = engine.executor._build_decode_input(requests)
-        return engine.executor.model(ctx, input_ids, ctx.positions).float()
-
-
-# ---------------------------------------------------------------------------
-# the control: how much does batch shape alone move the logits?
-# ---------------------------------------------------------------------------
-
-def control_batch_shape_noise(engine: Engine, prompt_tokens: list[int], width: int) -> float:
-    """Decode one state at batch size 1 and at batch size `width`.
-
-    No verify pass anywhere. Whatever this returns is the floor below which
-    "different logits" means "different GEMM tiling", not "different maths".
-    """
-    print(f"\n== control: plain decode at batch 1 vs batch {width} (no verify pass) ==")
-    requests = [prefill_one(engine, prompt_tokens)[0] for _ in range(width)]
-
-    single = decode_logits(engine, requests[:1])[0]
-    batched = decode_logits(engine, requests)
-
-    floor = max(float((single - batched[i]).abs().max()) for i in range(width))
-    spread = max(float((batched[0] - batched[i]).abs().max()) for i in range(1, width))
-    mean_dev = float((single - batched[0]).abs().mean())
-
-    for req in requests:
-        release(engine, req)
-
-    print(f"   max|batch1 - batch{width}| = {floor:.4f}   mean = {mean_dev:.4f}")
-    print(f"   spread among identical rows within one batch = {spread:.4f} "
-          f"(deterministic within a shape)")
-    print(f"   => noise floor for this model/dtype: {floor:.4f}")
-    return floor
 
 
 # ---------------------------------------------------------------------------
@@ -254,50 +172,6 @@ def gate_no_added_error(engine: Engine, prompt_tokens: list[int], k: int) -> boo
 # gate 3 — teacher-forced fidelity
 # ---------------------------------------------------------------------------
 
-def reference_walk(engine: Engine, prompt_tokens: list[int], max_tokens: int,
-                   eos_ids: set[int]) -> list[int]:
-    """Plain greedy decoding — the token sequence anchors are taken from."""
-    req, first = prefill_one(engine, prompt_tokens)
-    tokens = [first]
-
-    while len(tokens) < max_tokens and tokens[-1] not in eos_ids:
-        nxt = int(decode_logits(engine, [req])[0].argmax())
-        tokens.append(nxt)
-        req.append_output_token(nxt)
-
-    release(engine, req)
-    return tokens
-
-
-def sequential_steps(engine: Engine, prefix: list[int], steps: int
-                     ) -> tuple[list[int], list[torch.Tensor], list[float]]:
-    """Prefill `prefix`, then take `steps` plain decode steps.
-
-    Returns the tokens produced (the first from prefill, the rest from decode),
-    their logit rows, and each step's top-2 gap. This is the behaviour the
-    verify pass has to reproduce.
-    """
-    req, first = prefill_one(engine, prefix)
-    with torch.inference_mode():
-        tokens = [first]
-        rows: list[torch.Tensor] = []
-        gaps: list[float] = []
-
-        for _ in range(steps):
-            logits = decode_logits(engine, [req])[0]
-            top2 = torch.topk(logits, 2).values
-            rows.append(logits.clone())
-            gaps.append(float(top2[0] - top2[1]))
-            nxt = int(logits.argmax())
-            tokens.append(nxt)
-            req.append_output_token(nxt)
-
-    release(engine, req)
-    # `tokens[0]` came from the prefill; rows[i] is the step that produced
-    # tokens[i + 1].
-    return tokens[1:], rows, gaps
-
-
 def gate_contract_at_anchors(engine: Engine, prompt_tokens: list[int], reference: list[int],
                              k: int, floor: float, label: str) -> tuple[int, int, int]:
     """At each anchor, one verify pass must equal K+1 sequential decode steps.
@@ -334,8 +208,7 @@ def gate_contract_at_anchors(engine: Engine, prompt_tokens: list[int], reference
 
             # `truth[i]` is the token following the prefill token, so it is
             # exactly what proposal i should be to get accepted.
-            proposal = [t if i < num_correct else (t + 1) % vocab_size
-                        for i, t in enumerate(truth[:k])]
+            proposal = scripted_proposal(truth, num_correct, k, vocab_size)
 
             req, first = prefill_one(engine, prefix)
             engine.scheduler.block_manager.allocate_block_for_decode(req, extra_tokens=k)
@@ -377,17 +250,12 @@ def main() -> int:
     args = ap.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(TARGET)
-    prompts = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": p}],
-            tokenize=True, add_generation_prompt=True, enable_thinking=True)
-        for p in PROMPTS
-    ]
+    prompts = chat_prompts(tokenizer)
 
     engine = Engine(build_config())
     eos_ids = set(engine.config.eos_token_ids or set())
 
-    floor = control_batch_shape_noise(engine, prompts[0], args.k + 1)
+    floor = batch_shape_noise_floor(engine, prompts[0], args.k + 1, verbose=True)
     ok1 = gate_context_exact(engine, prompts[0])
     ok2 = gate_no_added_error(engine, prompts[0], args.k)
 

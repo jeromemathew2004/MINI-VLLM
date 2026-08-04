@@ -6,8 +6,12 @@ from minivllm.engine.request import Request
 
 def test_block_manager():
     BLOCK_SIZE = 256
-    manager = KVCacheBlockManager(10240, BLOCK_SIZE)
-    
+    # support_prefix_cache must be asked for explicitly: it defaults to False,
+    # and this test asserts on hash_to_block_id and num_cached_tokens, both of
+    # which only move when prefix caching is on. The default flipped at some
+    # point and left the test failing on line 1 of its first assertion block.
+    manager = KVCacheBlockManager(10240, BLOCK_SIZE, support_prefix_cache=True)
+
     tokens = [random.randint(1, 25600) for _ in range(25600)]
 
     req = Request(tokens)
