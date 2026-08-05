@@ -1,10 +1,17 @@
 # Speculative Decoding Progress
 
-Last updated: 2026-08-04
+Last updated: 2026-08-05
 
 This file is a concise handoff log for LLM agents. It tracks progress against [speculative-decoding-plan.md](speculative-decoding-plan.md) and should be updated as phases advance.
 
 ## Current Status
+
+**THE PLAN IS COMPLETE (closed 2026-08-05).** Phases 0 and 2-7 are done and
+gated; Phase 1 is deliberately optional and respecified. There is no next phase.
+New work starts from [docs/future_upgrades.md](docs/future_upgrades.md), not from
+this file's runbook — RESUME HERE is now a *restart* procedure (confirm the stack
+still runs) rather than a queue of pending work. See "What the plan produced"
+at the end for the four findings worth carrying forward.
 
 - **Phase 0: closed as a GO.** The earlier no-go rested on the assumption that
   the verify pass had to use the decode kernel. It does not — a verify pass is
@@ -635,7 +642,13 @@ workloads, **3 beat 2 on both**: it roughly halves how often the proposer fires
 while *raising* acceptance, because the rounds it drops are the losing ones.
 Default is 3. Raising it further keeps shrinking the open-ended loss toward
 zero (min=5 gives 194 tok/s at 0.7% speculation) at the cost of the repetitive
-win, so it is a real dial and Phase 7 should sweep it.
+win, so it is a real dial.
+
+Phase 7 did **not** end up sweeping it: `benchmark/spec_sweep.py` sweeps proposer
+x K x workload, and adding a third axis would have multiplied an already
+6-minute-per-configuration run. The 2-vs-3-vs-5 comparison above was measured
+with `experiments/spec_breakeven.py --ngram-min-match` instead, which is the
+cheaper instrument for it. Charting the curve is still unclaimed work.
 
 ### Gates
 
@@ -1027,7 +1040,9 @@ too coarse a quantum when the whole budget is ~1.6 GB.
 ## Deviations from the plan, and why
 
 **1. Phase 1 (train the draft model) was deferred until after Phase 6.** Done as
-intended; it is now the next work.
+intended — and the deferral became permanent: the n-gram proposer delivered the
+speedup Phase 1 existed to provide, so Phase 1 was never promoted back to the
+critical path. It is optional work, not pending work.
 
 Rejection sampling returns the target model's exact distribution regardless of
 draft quality — a poor draft lowers the acceptance rate but can never change
@@ -1099,9 +1114,10 @@ open-ended text**. Phase 1 is optional as a result rather than load-bearing.
 Nothing to do here unless the open-ended case is worth attacking, which is what
 step 2 is for. Two things to know before touching it:
 
-- **`ngram_min_match_len` is the dial**, and Phase 7 should sweep it. Higher
-  means fewer rounds on better evidence; it shrinks the open-ended loss and the
-  repetitive win together.
+- **`ngram_min_match_len` is the dial.** Higher means fewer rounds on better
+  evidence; it shrinks the open-ended loss and the repetitive win together. The
+  default moved 2 -> 3 on measurement. Phase 7 did not chart this axis — see the
+  note in the N-gram Proposer section for what was measured and with which tool.
 - **The skip path is load-bearing**, not an optimisation. Removing it turns the
   open-ended ~0.9x into ~0.7x.
 
@@ -1211,7 +1227,7 @@ the README's Speculative Decoding section. Results in Phase 7 Results above.
 
 What is left, in order of value, is in
 [docs/future_upgrades.md](docs/future_upgrades.md) — the distillation corpus
-(step 2 below, respecified with measured cost estimates), the batch-width
+(step 2 above, respecified with measured cost estimates), the batch-width
 ceiling on byte identity, top-k/top-p support, and prefix caching.
 
 The original framing for this phase, kept because it is what the chart ended up
@@ -1230,9 +1246,21 @@ suite measure the same thing. Sweep `--ngram-min-match` too: it is the
 coverage/acceptance dial and the shape of that curve is the most interesting
 thing the n-gram proposer has to say.
 
+**Against that framing, as executed:** the two-proposer/two-workload chart and
+the break-even framing landed as written. The `--ngram-min-match` sweep did not
+— it would have been a third axis on an already ~6-minute-per-configuration run,
+and the dial was measured with `spec_breakeven.py` instead. Charting it is still
+unclaimed.
+
 Calibrate expectations: a 0.6B target on a laptop GPU is close to the least
 favourable case for this technique, whose reputation comes from 7B+ models where
 fixed overheads vanish. A realistic landing zone here is 1.3-1.6x, not 3x.
+
+**That prediction was beaten, narrowly and only on one workload:** 1.81x on
+repetitive text, 0.94x on open-ended. Averaged over the two it lands inside the
+predicted band, which is the honest reading — the technique did not do better
+here than the hardware argument said it would, it did better on the workload
+that suits it and worse on the one that does not.
 
 Keep `experiments/spec_breakeven.py --end-to-end` as the cross-check on any
 throughput claim — a microbenchmark that disagrees with `Engine.generate` is
@@ -1242,13 +1270,17 @@ Two things to respect, both measured:
 
 - **The backend patch must be applied.** `patches/README.md`. Without it decode
   is nondeterministic above width 6 and every gate here becomes meaningless.
-- **Byte-identical greedy output is a tolerance, not a guarantee.** It holds in
-  every configuration measured so far (see Phase 5 Results), but batch shape
-  moves logits by up to 0.5 absolute and a near-tie can flip an emitted token
-  without anything being wrong. Keep the near-tie classification rather than
-  asserting bitwise equality blindly. This is cuBLAS retiling the linear layers
-  per batch shape; it is unrelated to the decode race and was not fixed by the
-  patch.
+- **Byte-identical greedy output is a tolerance, not a guarantee — and Phase 7
+  found its limit.** This bullet used to say it held in every configuration
+  measured; that is no longer true and the correction is the phase's main
+  finding. It holds while `num_requests * (K+1) <= 14`, above which the verify
+  pass writes different K/V into the cache and the runs diverge permanently.
+  Below that width the older caveat still applies: batch shape moves logits by
+  up to 0.5 absolute and a near-tie can flip an emitted token without anything
+  being wrong. Keep the near-tie classification rather than asserting bitwise
+  equality blindly. Both effects are cuBLAS retiling per batch shape, unrelated
+  to the decode race and not fixed by the patch — the difference is that logit
+  noise is transient and KV drift is not.
 
 ## Phase Checklist
 
@@ -1291,11 +1323,75 @@ Two things to respect, both measured:
   repetitive text at K=4**, 0.94x on open-ended. The sweep's output-hash check
   found the KV batch-width ceiling — see Phase 7 Results.
 
+## What the plan produced (closing summary, 2026-08-05)
+
+Phase 7 was the last phase, so this is the end of the plan rather than a
+checkpoint in it. What shipped, what it measures, and the four findings worth
+carrying past this file.
+
+### What shipped
+
+A working speculative-decoding path in the engine: `Executor.verify` +
+`Sampler.rejection_sample` + a multi-token `Scheduler.update`, driven by **two
+interchangeable proposers** (`speculative_method="draft"` or `"ngram"`) behind
+one verify-and-accept core. Guarded by 43 tests (`pytest tests/ --slow`), four
+standalone gate scripts, and a benchmark whose output hashes are themselves a
+correctness check. Headline: **1.81x on repetitive text at K=4**, 0.94x on
+open-ended, both measured end to end through `Engine.generate`.
+
+### The four findings
+
+**1. The binding constraint was launch overhead, not proposer quality.** The
+first honest measurement had speculation 10-21x slower per step than plain
+decode — break-even needed more accepted tokens than a round even proposes,
+i.e. impossible at *any* draft quality. The fix was CUDA graphs on the verify
+and propose passes (134.9 ms -> 19.9 ms per K=4 round). Everything downstream,
+including the decision that Phase 1 was not the cheap route to a speedup, only
+became measurable after that. On a 0.6B model on a laptop GPU, fixed overheads
+dominate the thing the technique is famous for.
+
+**2. A verify pass is decode-shaped, and the plan said otherwise.** Both the
+plan and the Phase 0 note routed it through `flash_attn_varlen_func` with a
+`block_table`, reasoning from the signature. Measured, that kernel's causal mask
+is top-left anchored, so a K+1-token query against a longer cache attends to the
+wrong keys. The shape that works is the *decode* kernel with the K+1 tokens in
+the **batch** dimension — its `assert seqlen_q == 1` constrains the query
+dimension, not the token count. This is also why graphs applied at all.
+
+**3. Byte-identical output is reproducibility, not correctness — and it has a
+measured ceiling.** Above verify width `num_requests * (K+1) > 14`, the wider
+projection GEMM writes *different K/V into the paged cache for the same token*.
+Unlike logit noise that is permanent, so the runs diverge arbitrarily far
+downstream at a step that need not be a near-tie. The output stays correct —
+rejection sampling remains exactly distribution-preserving — but it is a
+different valid sample. Every gate here states its claim against a measured
+noise floor for this reason.
+
+**4. The backend had a real bug, and speculative decoding is what found it.**
+`mini-flash-attention`'s decode kernel aliased its cross-warp softmax reduction
+over its output accumulator with no barrier, making plain decode nondeterministic
+and wrong at batch width >= 6. A verify pass runs at width `num_requests * (K+1)`
+and hit it immediately. One `__syncthreads()`; kept in `patches/` and **required**
+for any rebuild.
+
+### What a reader should distrust
+
+- **The throughput numbers are single-host and workload-specific.** 1.81x is one
+  RTX 3050, one 0.6B model, two hand-written prompt sets. Both halves of the
+  n-gram result must be quoted together; it is not a general-purpose accelerator.
+- **Run-to-run variance is a few points**, so break-even figures (~30% n-gram,
+  ~60% draft) should not be quoted to a decimal.
+- **The width-14 ceiling is a property of this host's cuBLAS**, not a universal
+  constant. Re-measure with `experiments/kv_shape_drift.py` anywhere else.
+
 ## Handoff Notes for Agents
 
-- **Start at "RESUME HERE" above.** The environment is built, speculative
-  decoding runs end to end through Phase 6, and the n-gram proposer gives it a
-  measured speedup on repetitive workloads. Next work is Phase 7 (step 3).
+- **The plan is complete — there is no next phase.** The environment is built,
+  speculative decoding runs end to end, the suite is green, and the n-gram
+  proposer gives a measured 1.81x on repetitive workloads. Start at "RESUME
+  HERE" only to confirm the stack still runs (step 0); everything after that
+  step is a record of finished work. New work comes from
+  [docs/future_upgrades.md](docs/future_upgrades.md).
 - Read [speculative-decoding-plan.md](speculative-decoding-plan.md) first.
 - [experiments/engine_spec_gate.py](experiments/engine_spec_gate.py) is the
   engine-level correctness gate and the fastest way to confirm the stack is
